@@ -44,8 +44,11 @@ static common_speculative_output_limits server_output_limits(const common_params
         return { params.n_batch, 1 };
     }
 
+    const int32_t n_draft_max = common_speculative_n_max(&params.speculative);
+    const int32_t n_chains    = std::max(1, params.speculative.draft.n_chains);
+
     auto result = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+            params.n_batch, params.n_parallel, n_draft_max * n_chains);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -254,6 +257,13 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+
+    // multi-chain speculation: per-chain drafts and their batch row indices ([root, chain rows...]).
+    // chain 0 mirrors spec_draft / spec_i_batch and is decoded on the owning slot seq (legacy path);
+    // chains > 0 are decoded on dedicated sibling seq ids (spec_sib_base + c - 1).
+    std::vector<llama_tokens> spec_chains;
+    std::vector<std::vector<int32_t>> spec_i_batch_c;
+    llama_seq_id spec_sib_base = 0;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -382,6 +392,8 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_chains.clear();
+            spec_i_batch_c.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -892,6 +904,7 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    int32_t spec_n_chains = 1; // multi-chain: effective number of chains (clamped by the impl)
 
     common_speculative_ptr spec;
 
@@ -1259,6 +1272,7 @@ private:
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                spec_n_chains = common_speculative_n_chains(spec.get());
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
