@@ -1357,6 +1357,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // multi-chain: number of draft chains generated per seq (1 = single chain, bit-for-bit legacy).
+    // only supported for the single-head, non-shared-MEM MTP path with CPU draft sampling (qwen35).
+    // per-seq state (pending_h, smpls, verify_h, i_last, ...) is indexed flat: seq_id*n_chains + chain.
+    // chain 0 lives on the owning seq_id itself (legacy layout); chains c>0 live on sibling seq ids
+    // n_seq + seq_id*(n_chains-1) + (c-1) in both ctx_dft and ctx_tgt.
+    int32_t n_chains = 1;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1417,6 +1424,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        // multi-chain speculation setup (see n_chains comment above)
+        n_chains = std::max(1, (int) this->params.n_chains);
+        if (n_chains > 1 && (chain_heads || is_mem_shared || this->params.backend_sampling)) {
+            SPC_WRN("n_chains=%d is only supported for the single-head MTP path with CPU draft "
+                    "sampling (chain_heads=%d, is_mem_shared=%d, backend_sampling=%d) - falling back to 1 chain\n",
+                    n_chains, (int) chain_heads, (int) is_mem_shared, (int) this->params.backend_sampling);
+            n_chains = 1;
+        }
+        if (n_chains > 1) {
+            const uint32_t n_seq_dft   = llama_n_seq_max(ctx_dft);
+            const int32_t  n_batch_dft = (int32_t) llama_n_batch(ctx_dft);
+            const int32_t  n_seq_sib   = (int) n_seq * n_chains; // ctx_dft seq ids used: n_seq (chain0) + n_seq*(N-1) siblings
+
+            if (n_seq_sib > (int) n_seq_dft || n_chains * (int) n_seq > n_batch_dft) {
+                const int32_t n_chains_max = std::max(1,
+                        std::min((int) n_seq_dft / std::max(1, (int) n_seq), n_batch_dft / std::max(1, (int) n_seq)));
+                if (n_chains > n_chains_max) {
+                    SPC_WRN("n_chains clamped to %d (ctx_dft n_seq_max=%u, n_batch=%d, n_seq=%u)\n",
+                            n_chains_max, n_seq_dft, n_batch_dft, (uint32_t) n_seq);
+                    n_chains = n_chains_max;
+                }
+            }
+        }
+        if (n_chains > 1) {
+            // per-chain samplers: [seq_id*n_chains + chain]
+            smpls.resize((size_t) n_seq * n_chains);
+            for (auto & s : smpls) {
+                if (s) {
+                    continue;
+                }
+                common_params_sampling sparams;
+                sparams.no_perf  = false;
+                sparams.top_k    = 10;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+                s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+            }
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
@@ -1427,14 +1472,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
-        pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        const size_t n_flat = (size_t) n_seq * n_chains; // == n_seq for the single-chain path
 
-        i_last.assign(n_seq, -1);
-        i_batch_beg.assign(n_seq, -1);
-        i_batch_end.assign(n_seq, -1);
+        pending_h.assign(n_flat, std::vector<float>(n_embd, 0.0f));
 
-        verify_h.assign(n_seq, {});
-        verify_h_rows.assign(n_seq, 0);
+        i_last.assign(n_flat, -1);
+        i_batch_beg.assign(n_flat, -1);
+        i_batch_end.assign(n_flat, -1);
+
+        verify_h.assign(n_flat, {});
+        verify_h_rows.assign(n_flat, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
