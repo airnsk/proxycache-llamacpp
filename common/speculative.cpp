@@ -1565,7 +1565,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     i_batch_beg[f] = k;
                 }
             } else {
-                // sibling chain rows (ctx_tgt sibling seq ids map to ctx_dft sibling seq ids)
+                // sibling chain rows exist only in ctx_tgt: map them to their flat state so the
+                // verify_h extraction below can pick up each chain's hidden rows
                 for (int32_t c = 1; c < n_chains; ++c) {
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                         if (sid0 == chain_seq_id(seq_id, c)) {
@@ -1589,55 +1590,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
+            // sibling-chain rows are not replayed into ctx_dft: their draft KV is rebuilt
+            // from scratch each round in draft_multi (rm + seq_cp of the owning prefix)
             for (int k = 0; k < n_tokens; ++k) {
-                if (batch_in.n_seq_id[k] == 1) {
-                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-                } else {
-                    std::vector<llama_seq_id> tags(batch_in.seq_id[k], batch_in.seq_id[k] + batch_in.n_seq_id[k]);
-                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], tags, 0);
-                }
-            }
+                GGML_ASSERT(batch_in.n_seq_id[k] >= 1);
 
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (int32_t f = 0; f < n_flat; ++f) {
-                if (i_batch_beg[f] < 0) {
+                const llama_seq_id sid0 = batch_in.seq_id[k][0];
+                if (sid0 < 0 || sid0 >= (llama_seq_id) n_seq) {
                     continue;
                 }
 
-                set_h(i_batch_beg[f], pending_h[f].data());
+                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { sid0 }, 0);
             }
 
-            if (n_chains > 1) {
-                // the right-shift above gives each chain's first sibling row the h of the
-                // previous chain's last row; the correct pair is the shared root row's h
-                const float * h_tgt_all = llama_get_embeddings_nextn(ctx_tgt);
-                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                    const int32_t f0 = (int32_t) seq_id * n_chains;
-                    if (i_batch_beg[f0] < 0) {
-                        continue;
+            // h-pair per kept row: the first row of each seq uses pending_h from the previous
+            // run, every other row uses the h of the same seq's previous row in batch_in
+            // (shift-by-one). assumes that the tokens are sequential for each sequence
+            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+            //                                                       ^--- this is a problem
+            // TODO: this is generally true, but would be nice to assert it
+            {
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+                int32_t k_prev = -1; // previous kept batch_in row (same seq, contiguous)
+
+                for (int k = 0; k < n_tokens; ++k) {
+                    GGML_ASSERT(batch_in.n_seq_id[k] >= 1);
+
+                    const llama_seq_id sid0 = batch_in.seq_id[k][0];
+                    if (sid0 < 0 || sid0 >= (llama_seq_id) n_seq) {
+                        continue; // sibling row
                     }
-                    for (int32_t c = 1; c < n_chains; ++c) {
-                        const int32_t f = f0 + c;
-                        if (i_batch_beg[f] < 0) {
-                            continue;
-                        }
-                        std::memcpy(batch.embd + (size_t) i_batch_beg[f] * n_embd,
-                                    h_tgt_all + (size_t) i_batch_beg[f0] * n_embd, row_bytes);
+
+                    const int32_t i_dst = batch.n_tokens - 1; // this row was added above in the same order
+
+                    const bool is_first = (k_prev < 0) ||
+                        (batch_in.seq_id[k_prev][0] != sid0);
+
+                    if (is_first) {
+                        std::memcpy(batch.embd + (size_t) i_dst * n_embd,
+                                pending_h[(size_t) sid0 * n_chains].data(), row_bytes);
+                    } else {
+                        std::memcpy(batch.embd + (size_t) i_dst * n_embd,
+                                h_tgt + (size_t) k_prev * n_embd, row_bytes);
                     }
+
+                    k_prev = k;
                 }
             }
 
