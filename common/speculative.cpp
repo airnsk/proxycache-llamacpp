@@ -1538,14 +1538,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
 
-        for (int k = 0; k < n_tokens; ++k) {
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+        const int32_t n_flat = (int32_t) (n_seq * n_chains); // == n_seq for the single-chain path
 
-                if (batch_in.seq_id[k][0] == seq_id) {
-                    i_batch_end[seq_id] = k;
-                    if (i_batch_beg[seq_id] < 0) {
-                        i_batch_beg[seq_id] = k;
+        for (int k = 0; k < n_tokens; ++k) {
+            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+
+            for (int32_t f = 0; f < n_flat; ++f) {
+                const llama_seq_id sid = chain_seq_id((llama_seq_id) (f / n_chains), f % n_chains);
+
+                if (batch_in.seq_id[k][0] == sid) {
+                    i_batch_end[f] = k;
+                    if (i_batch_beg[f] < 0) {
+                        i_batch_beg[f] = k;
                     }
                 }
             }
@@ -1579,12 +1583,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
             };
 
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
+            for (int32_t f = 0; f < n_flat; ++f) {
+                if (i_batch_beg[f] < 0) {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                set_h(i_batch_beg[f], pending_h[f].data());
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1594,10 +1598,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
+                        if (i_batch_beg[(size_t) seq_id * n_chains] < 0) {
                             continue;
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[(size_t) seq_id * n_chains]], -1);
                     }
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
@@ -1619,28 +1623,43 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_end[seq_id] < 0) {
+        for (int32_t f = 0; f < n_flat; ++f) {
+            if (i_batch_end[f] < 0) {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            const int32_t n_rows = i_batch_end[f] - i_batch_beg[f] + 1;
+            verify_h_rows[f] = n_rows;
+            verify_h[f].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[f] + i);
+                std::memcpy(verify_h[f].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            std::memcpy(pending_h[f].data(),
+                    verify_h[f].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        // multi-chain: dispatch to the chain-aware path when the caller provides per-chain buffers
+        if (n_chains > 1) {
+            bool any_chains = false;
+            for (auto & dp : dparams) {
+                if (dp.drafting && dp.chains != nullptr) {
+                    any_chains = true;
+                    break;
+                }
+            }
+            if (any_chains) {
+                draft_multi(dparams);
+                return;
+            }
+        }
+
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1660,15 +1679,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
-            common_sampler_reset(smpls[seq_id].get());
+            common_sampler_reset(smpls[(size_t) seq_id * n_chains].get());
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[(size_t) seq_id * n_chains].data(), row_bytes);
 
-            i_last[seq_id] = batch.n_tokens - 1;
+            i_last[(size_t) seq_id * n_chains] = batch.n_tokens - 1;
 
             if (chain_heads) {
-                chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+                chain_h[seq_id].assign(pending_h[(size_t) seq_id * n_chains].begin(), pending_h[(size_t) seq_id * n_chains].end());
             }
         }
 
@@ -1707,10 +1726,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                auto * smpl = smpls[seq_id].get();
+                auto * smpl = smpls[(size_t) seq_id * n_chains].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                common_sampler_sample(smpl, ctx_dft, i_last[(size_t) seq_id * n_chains], true);
+                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[(size_t) seq_id * n_chains]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1765,7 +1784,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
 
-                i_last[seq_id] = batch.n_tokens - 1;
+                i_last[(size_t) seq_id * n_chains] = batch.n_tokens - 1;
             }
 
             if (batch.n_tokens == 0) {
@@ -1791,19 +1810,248 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // --- multi-chain helpers -------------------------------------------------
+    // flat state index for (seq, chain); chain 0 = the owning seq itself (legacy layout)
+    int32_t flat_idx(llama_seq_id seq_id, int32_t chain) const {
+        return (int32_t) seq_id * n_chains + chain;
+    }
+
+    // ctx_dft sequence id hosting chain `chain` of owning seq_id
+    llama_seq_id chain_seq_id(llama_seq_id seq_id, int32_t chain) const {
+        if (chain == 0) {
+            return seq_id;
+        }
+        return (llama_seq_id) ((int32_t) n_seq + (int32_t) seq_id * (n_chains - 1) + (chain - 1));
+    }
+
+    // generate n_chains draft chains per drafting sequence in one ctx_dft batch:
+    //   - decode the shared root (id_last, pending_h) once per seq on the owning seq id
+    //   - chain c takes the c-th top candidate at the first draft position (c=0 -> greedy top-1)
+    //   - chains c>0 get their own sibling seq id with a copied prefix KV (meta-only copy when
+    //     the draft cache is unified), then continue greedily like chain 0
+    // all chains share the verify batch downstream; acceptance/winner is the caller's job.
+    void draft_multi(common_speculative_draft_params_vec & dparams) {
+        auto * ctx_dft = params.ctx_dft;
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        common_batch_clear(batch);
+
+        const size_t n_flat = (size_t) n_seq * n_chains;
+
+        std::vector<bool>        active(n_flat, false);
+        std::vector<int32_t>     last_row(n_flat, -1);
+        std::vector<llama_pos>   pos_next(n_flat, 0);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            GGML_ASSERT(dp.chains != nullptr);
+
+            dp.chains->resize(n_chains);
+            for (auto & ch : *dp.chains) {
+                ch.clear();
+            }
+
+            const int32_t f0 = flat_idx(seq_id, 0);
+
+            common_sampler_reset(smpls[f0].get());
+
+            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[f0].data(), row_bytes);
+
+            last_row[f0] = batch.n_tokens - 1;
+            pos_next[f0] = dp.n_past + 1;
+        }
+
+        if (batch.n_tokens == 0) {
+            return;
+        }
+
+        if (llama_decode(ctx_dft, batch) != 0) {
+            SPC_ERR("draft_multi: root llama_decode failed\n");
+            return;
+        }
+
+        // branch the chains from the root distribution
+        common_batch_clear(batch);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            const int32_t f0 = flat_idx(seq_id, 0);
+
+            common_sampler_sample(smpls[f0].get(), ctx_dft, last_row[f0], true);
+            const auto * cur_p = common_sampler_get_candidates(smpls[f0].get(), true);
+
+            if (cur_p->size == 0 || cur_p->data[0].p < params.p_min) {
+                continue; // even the best candidate is too weak - skip all chains
+            }
+
+            const float * h_root = llama_get_embeddings_nextn_ith(ctx_dft, last_row[f0]);
+
+            // chain 0: greedy top-1 on the owning seq (same token / same order as the single-chain path)
+            {
+                const llama_token id0 = cur_p->data[0].id;
+
+                common_sampler_accept(smpls[f0].get(), id0, true);
+                (*dp.chains)[0].push_back(id0);
+                active[f0] = true;
+
+                common_batch_add(batch, id0, pos_next[f0], { seq_id }, true);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_root, row_bytes);
+
+                last_row[f0] = batch.n_tokens - 1;
+            }
+
+            for (int32_t c = 1; c < n_chains; ++c) {
+                if ((size_t) c >= cur_p->size) {
+                    continue; // not enough distinct candidates - fewer chains this round
+                }
+
+                const int32_t    f  = flat_idx(seq_id, c);
+                const llama_seq_id sib = chain_seq_id(seq_id, c);
+                const llama_token idc = cur_p->data[c].id;
+
+                common_sampler_reset(smpls[f].get());
+                common_sampler_accept(smpls[f].get(), idc, true);
+
+                // fresh sibling KV = owning prefix [0, n_past] + root token position
+                llama_memory_seq_rm(mem_dft, sib, 0, -1);
+                llama_memory_seq_cp(mem_dft, seq_id, sib, 0, dp.n_past + 2);
+
+                (*dp.chains)[c].push_back(idc);
+                active[f] = true;
+                pos_next[f] = dp.n_past + 1;
+
+                common_batch_add(batch, idc, pos_next[f], { sib }, true);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_root, row_bytes);
+
+                last_row[f] = batch.n_tokens - 1;
+            }
+        }
+
+        // greedy continuation of all active chains in shared decode steps
+        int n_active = 0;
+        for (size_t f = 0; f < n_flat; ++f) {
+            n_active += active[f] ? 1 : 0;
+        }
+
+        while (n_active > 0 && batch.n_tokens > 0) {
+            if (llama_decode(ctx_dft, batch) != 0) {
+                SPC_ERR("draft_multi: llama_decode failed\n");
+                break;
+            }
+
+            common_batch_clear(batch);
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+
+                if (!dp.drafting) {
+                    continue;
+                }
+
+                for (int32_t c = 0; c < n_chains; ++c) {
+                    const int32_t f = flat_idx(seq_id, c);
+
+                    if (!active[f]) {
+                        continue;
+                    }
+
+                    auto & result = (*dp.chains)[c];
+
+                    common_sampler_sample(smpls[f].get(), ctx_dft, last_row[f], true);
+                    const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, last_row[f]);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpls[f].get(), true);
+                    if (cur_p->size == 0) {
+                        active[f] = false;
+                        n_active--;
+                        continue;
+                    }
+
+                    const llama_token id = cur_p->data[0].id;
+
+                    if (cur_p->data[0].p < params.p_min) {
+                        active[f] = false;
+                        n_active--;
+                        continue;
+                    }
+
+                    common_sampler_accept(smpls[f].get(), id, true);
+
+                    result.push_back(id);
+
+                    if (params.n_max <= (int) result.size()) {
+                        active[f] = false;
+                        n_active--;
+                        continue;
+                    }
+
+                    pos_next[f] += 1;
+
+                    common_batch_add(batch, id, pos_next[f], { chain_seq_id(seq_id, c) }, true);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+
+                    last_row[f] = batch.n_tokens - 1;
+                }
+            }
+        }
+
+        // finalize: n_min filter, per-call n_max clamp; mirror the first non-empty chain into result
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            if (dp.chains == nullptr) {
+                continue;
+            }
+
+            for (auto & ch : *dp.chains) {
+                if (params.n_min > (int) ch.size()) {
+                    ch.clear();
+                }
+                if (dp.n_max > 0 && (int) ch.size() > dp.n_max) {
+                    ch.resize(dp.n_max);
+                }
+            }
+
+            *dp.result = llama_tokens();
+            for (auto & ch : *dp.chains) {
+                if (!ch.empty()) {
+                    *dp.result = ch;
+                    break;
+                }
+            }
+        }
+    }
+
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
-        const int32_t n_rows = verify_h_rows[seq_id];
+        const int32_t n_rows = verify_h_rows[(size_t) seq_id * n_chains];
         if (n_rows <= 0) {
             return;
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        std::memcpy(pending_h[(size_t) seq_id * n_chains].data(), verify_h[(size_t) seq_id * n_chains].data() + (size_t) i_h * n_embd, row_bytes);
     }
 };
 
@@ -2583,6 +2831,13 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // multi-chain speculation: chain 0 lives on the owning seq ids [0, n_parallel),
+    // chains > 0 get dedicated sibling seq ids in the draft context
+    if (spec_mtp && params.speculative.draft.n_chains > 1) {
+        cparams.n_seq_max = std::max<uint32_t>(cparams.n_seq_max,
+                (uint32_t) std::max(1, params.n_parallel) * (uint32_t) params.speculative.draft.n_chains);
+    }
 
     std::string model_path;
     if (has_draft) {
