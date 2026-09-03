@@ -1873,7 +1873,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             common_sampler_reset(smpls[f0].get());
 
-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+            // feed the root row once for the owning seq and all sibling chain seqs (unified KV:
+            // a single set of KV cells tagged with all chain seq ids) - no prefix copies needed
+            std::vector<llama_seq_id> seqs;
+            seqs.reserve(n_chains);
+            seqs.push_back(seq_id);
+
+            for (int32_t c = 1; c < n_chains; ++c) {
+                const llama_seq_id sib = chain_seq_id(seq_id, c);
+
+                // drop last round's speculative cells of this sibling (root+prefix tags are re-added below)
+                llama_memory_seq_rm(mem_dft, sib, dp.n_past + 1, -1);
+
+                seqs.push_back(sib);
+            }
+
+            common_batch_add(batch, dp.id_last, dp.n_past, seqs, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[f0].data(), row_bytes);
 
             last_row[f0] = batch.n_tokens - 1;
@@ -1935,10 +1950,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_reset(smpls[f].get());
                 common_sampler_accept(smpls[f].get(), idc, true);
-
-                // fresh sibling KV = owning prefix [0, n_past] + root token position
-                llama_memory_seq_rm(mem_dft, sib, 0, -1);
-                llama_memory_seq_cp(mem_dft, seq_id, sib, 0, dp.n_past + 2);
 
                 (*dp.chains)[c].push_back(idc);
                 active[f] = true;
@@ -2037,6 +2048,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 if (dp.n_max > 0 && (int) ch.size() > dp.n_max) {
                     ch.resize(dp.n_max);
+                }
+            }
+
+            // the mirror (result) is chain 0; if it did not survive, the whole round is single-chain
+            if (dp.chains->at(0).empty()) {
+                for (auto & ch : *dp.chains) {
+                    ch.clear();
                 }
             }
 
@@ -2866,6 +2884,14 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // multi-chain speculation: sibling chain seq ids live above [0, n_parallel); they share
+    // KV cells with the owning seq via multi-seq root rows, which requires a unified cache
+    if (spec_mtp && params.speculative.draft.n_chains > 1) {
+        cparams.kv_unified  = true;
+        cparams.n_seq_max   = std::max<uint32_t>(cparams.n_seq_max,
+                (uint32_t) std::max(1, params.n_parallel) * (uint32_t) params.speculative.draft.n_chains);
+    }
 
     // multi-chain speculation: chain 0 lives on the owning seq ids [0, n_parallel),
     // chains > 0 get dedicated sibling seq ids in the draft context
