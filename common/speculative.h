@@ -69,6 +69,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // multi-chain speculation (draft-mtp only): when non-null, draft() fills (*chains)[k]
+    // for each chain k in [0, n_chains). chain 0 is the greedy top-1 chain and is also
+    // mirrored into `result` (alias of chains->front()) so all single-chain consumers keep
+    // working unchanged. the owning slot seq is responsible for KV cleanup of the sibling
+    // chain seqs after verification.
+    std::vector<llama_tokens> * chains = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
