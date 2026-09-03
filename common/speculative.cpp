@@ -171,6 +171,17 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // multi-chain speculation support (draft-mtp): number of chains actually enabled after clamping
+    virtual int32_t n_chains_active() const {
+        return 1;
+    }
+
+    // accept the verified prefix coming from a specific winning draft chain (multi-chain).
+    // implementations without chain support fall back to the regular accept()
+    virtual void accept_chain(llama_seq_id seq_id, uint16_t n_accepted, int32_t /*chain*/) {
+        accept(seq_id, n_accepted, false);
+    }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -2053,6 +2064,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[(size_t) seq_id * n_chains].data(), verify_h[(size_t) seq_id * n_chains].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    int32_t n_chains_active() const override {
+        return n_chains;
+    }
+
+    // the server rolls back ctx_tgt to the accepted prefix; here we only need to move the
+    // MTP carryover (pending_h) to the hidden state that follows the last accepted token of
+    // the *winning* chain. sibling draft seqs are re-primed from scratch on the next draft().
+    void accept_chain(llama_seq_id seq_id, uint16_t n_accepted, int32_t chain) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const int32_t f = flat_idx(seq_id, (chain > 0 && chain < n_chains) ? chain : 0);
+
+        const int32_t n_rows = verify_h_rows[f];
+        if (n_rows <= 0) {
+            return;
+        }
+
+        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        std::memcpy(pending_h[flat_idx(seq_id, 0)].data(), verify_h[f].data() + (size_t) i_h * n_embd, row_bytes);
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -3174,7 +3209,7 @@ void common_speculative_draft(common_speculative * spec) {
     }
 }
 
-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+void common_speculative_accept_chain(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t chain) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3198,7 +3233,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(seq_id, n_accepted, false);
+        impl->accept_chain(seq_id, n_accepted, chain);
         impl->n_call_accept++;
     }
 
@@ -3208,6 +3243,23 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_accept_chain(spec, seq_id, n_accepted, 0);
+}
+
+int32_t common_speculative_n_chains(common_speculative * spec) {
+    if (spec == nullptr) {
+        return 1;
+    }
+
+    int32_t result = 1;
+    for (auto & impl : spec->impls) {
+        result = std::max(result, impl->n_chains_active());
+    }
+
+    return result;
 }
 
 // TODO: support the case of more than one speculative implementations having a state

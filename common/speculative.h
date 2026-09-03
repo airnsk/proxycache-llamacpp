@@ -92,6 +92,12 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// multi-chain: accept the verified prefix coming from a specific winning draft chain
+void common_speculative_accept_chain(common_speculative * spec, llama_seq_id, uint16_t n_accepted, int32_t chain);
+
+// multi-chain: number of chains actually enabled (>= 1), after resource clamping
+int32_t common_speculative_n_chains(common_speculative * spec);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
