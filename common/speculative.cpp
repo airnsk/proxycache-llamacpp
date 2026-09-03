@@ -1552,15 +1552,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t n_flat = (int32_t) (n_seq * n_chains); // == n_seq for the single-chain path
 
         for (int k = 0; k < n_tokens; ++k) {
-            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+            GGML_ASSERT(batch_in.n_seq_id[k] >= 1);
 
-            for (int32_t f = 0; f < n_flat; ++f) {
-                const llama_seq_id sid = chain_seq_id((llama_seq_id) (f / n_chains), f % n_chains);
+            // chain 0 (and the single-chain path): rows tagged first with the owning seq id.
+            // multi-seq rows (the shared verification root) are matched by their first tag only.
+            const llama_seq_id sid0 = batch_in.seq_id[k][0];
 
-                if (batch_in.seq_id[k][0] == sid) {
-                    i_batch_end[f] = k;
-                    if (i_batch_beg[f] < 0) {
-                        i_batch_beg[f] = k;
+            if (sid0 >= 0 && sid0 < (llama_seq_id) n_seq) {
+                const int32_t f = (int32_t) sid0 * n_chains;
+                i_batch_end[f] = k;
+                if (i_batch_beg[f] < 0) {
+                    i_batch_beg[f] = k;
+                }
+            } else {
+                // sibling chain rows (ctx_tgt sibling seq ids map to ctx_dft sibling seq ids)
+                for (int32_t c = 1; c < n_chains; ++c) {
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        if (sid0 == chain_seq_id(seq_id, c)) {
+                            const int32_t f = (int32_t) seq_id * n_chains + c;
+                            i_batch_end[f] = k;
+                            if (i_batch_beg[f] < 0) {
+                                i_batch_beg[f] = k;
+                            }
+                        }
                     }
                 }
             }
@@ -1576,7 +1590,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                if (batch_in.n_seq_id[k] == 1) {
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                } else {
+                    std::vector<llama_seq_id> tags(batch_in.seq_id[k], batch_in.seq_id[k] + batch_in.n_seq_id[k]);
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], tags, 0);
+                }
             }
 
             // shift the tgt embeddings to the right by one position
@@ -1600,6 +1619,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 set_h(i_batch_beg[f], pending_h[f].data());
+            }
+
+            if (n_chains > 1) {
+                // the right-shift above gives each chain's first sibling row the h of the
+                // previous chain's last row; the correct pair is the shared root row's h
+                const float * h_tgt_all = llama_get_embeddings_nextn(ctx_tgt);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    const int32_t f0 = (int32_t) seq_id * n_chains;
+                    if (i_batch_beg[f0] < 0) {
+                        continue;
+                    }
+                    for (int32_t c = 1; c < n_chains; ++c) {
+                        const int32_t f = f0 + c;
+                        if (i_batch_beg[f] < 0) {
+                            continue;
+                        }
+                        std::memcpy(batch.embd + (size_t) i_batch_beg[f] * n_embd,
+                                    h_tgt_all + (size_t) i_batch_beg[f0] * n_embd, row_bytes);
+                    }
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1882,8 +1921,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (int32_t c = 1; c < n_chains; ++c) {
                 const llama_seq_id sib = chain_seq_id(seq_id, c);
 
-                // drop last round's speculative cells of this sibling (root+prefix tags are re-added below)
-                llama_memory_seq_rm(mem_dft, sib, dp.n_past + 1, -1);
+                // drop all sibling tags from last round (prefix + root are re-primed below)
+                llama_memory_seq_rm(mem_dft, sib, 0, -1);
 
                 seqs.push_back(sib);
             }
@@ -1950,6 +1989,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_reset(smpls[f].get());
                 common_sampler_accept(smpls[f].get(), idc, true);
+
+                // sibling sees the owning prefix [0, n_past-1]; the root cell (pos n_past) was
+                // tagged with all chain seqs by the root decode above. the range stops before
+                // n_past + 1 so the sibling never inherits chain-0's first drafted token.
+                llama_memory_seq_cp(mem_dft, seq_id, sib, 0, dp.n_past);
 
                 (*dp.chains)[c].push_back(idc);
                 active[f] = true;
