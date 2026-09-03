@@ -1912,22 +1912,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             common_sampler_reset(smpls[f0].get());
 
-            // feed the root row once for the owning seq and all sibling chain seqs (unified KV:
-            // a single set of KV cells tagged with all chain seq ids) - no prefix copies needed
-            std::vector<llama_seq_id> seqs;
-            seqs.reserve(n_chains);
-            seqs.push_back(seq_id);
-
-            for (int32_t c = 1; c < n_chains; ++c) {
-                const llama_seq_id sib = chain_seq_id(seq_id, c);
-
-                // drop all sibling tags from last round (prefix + root are re-primed below)
-                llama_memory_seq_rm(mem_dft, sib, 0, -1);
-
-                seqs.push_back(sib);
-            }
-
-            common_batch_add(batch, dp.id_last, dp.n_past, seqs, true);
+            // root row (id_last) decodes once on the owning seq; siblings are primed from it
+            // via llama_memory_seq_cp below (agreed design - no multi-tag rows, the ctx_dft
+            // batch is allocated with n_seq_max = 1 per row-group)
+            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[f0].data(), row_bytes);
 
             last_row[f0] = batch.n_tokens - 1;
@@ -1990,10 +1978,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[f].get());
                 common_sampler_accept(smpls[f].get(), idc, true);
 
-                // sibling sees the owning prefix [0, n_past-1]; the root cell (pos n_past) was
-                // tagged with all chain seqs by the root decode above. the range stops before
-                // n_past + 1 so the sibling never inherits chain-0's first drafted token.
-                llama_memory_seq_cp(mem_dft, seq_id, sib, 0, dp.n_past);
+                // fresh sibling KV: drop everything from last round, then copy the owning
+                // prefix including the just-decoded root cell (positions [0, n_past]). chain-0's
+                // first drafted token (pos n_past+1) is not copied - it is decoded after this
+                // loop, so no stale cell exists yet; the next round removes leftovers on rm.
+                llama_memory_seq_rm(mem_dft, sib, 0, -1);
+                llama_memory_seq_cp(mem_dft, seq_id, sib, 0, dp.n_past + 1);
 
                 (*dp.chains)[c].push_back(idc);
                 active[f] = true;
