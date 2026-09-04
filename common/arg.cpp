@@ -4167,8 +4167,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-chains"}, "N",
         string_format("number of draft chains verified in one batch for multi-chain speculation (1 = single chain, default: %d); requires draft-mtp", params.speculative.draft.n_chains),
         [](common_params & params, int value) {
-            if (value < 1 || value > 4) {
-                throw std::invalid_argument("invalid value (expected 1-4)");
+            if (value < 1 || value > 16) {
+                throw std::invalid_argument("invalid value (expected 1-16)");
             }
             params.speculative.draft.n_chains = value;
         }
