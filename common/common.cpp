@@ -1622,13 +1622,13 @@ done:
     return res;
 }
 
-static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, const char * tag) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
         const llama_pos pos_min = llama_memory_seq_pos_min(mem, seq_id);
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d [ctx=%p n_rs_seq=%u pos_min=%d pos_max=%d]\n",
-            seq_id, p0, p1, (void *) ctx, llama_n_rs_seq(ctx), pos_min, pos_max).c_str());
+        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d [%s ctx=%p n_rs_seq=%u n_seq_max=%u pos_min=%d pos_max=%d]\n",
+            seq_id, p0, p1, tag, (void *) ctx, llama_n_rs_seq(ctx), llama_n_seq_max(ctx), pos_min, pos_max).c_str());
     }
 }
 
@@ -1648,9 +1648,9 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
 }
 
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    common_context_seq_rm(ctx_tgt, seq_id, p0, p1, "tgt");
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        common_context_seq_rm(ctx_dft, seq_id, p0, p1, "dft");
     }
 }
 
