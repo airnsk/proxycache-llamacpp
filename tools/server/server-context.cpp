@@ -3171,7 +3171,8 @@ private:
             if (!draft.empty()) {
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)) ||
+                    spec_n_chains > 1; // multi-chain: the winner commit replays from the pre-verify checkpoint every round
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
@@ -4068,7 +4069,6 @@ private:
                 const bool multi = spec_n_chains > 1 && !slot.spec_chains_paused && synth_probs.empty();
 
                 int32_t winner_chain = 0;
-                common_sampler_ptr smpl_winner(nullptr);
 
                 if (multi && !slot.spec_i_batch_c.empty() && (params_base.speculative.draft.approx || full_miss_chain0)) {
                     size_t best_len = accepted.size();
@@ -4091,7 +4091,6 @@ private:
                             best_len      = accepted_c.size();
                             accepted      = std::move(accepted_c);
                             winner_chain  = c;
-                            smpl_winner.reset(common_sampler_clone(smpl_c.get()));
                         }
 
                         if (!params_base.speculative.draft.approx && winner_chain > 0) {
@@ -4109,22 +4108,21 @@ private:
                 }
 
                 if (winner_chain > 0) {
-                    // commit the winner in place: its rows share positions with chain 0's speculative
-                    // rows (same root). drop chain 0's speculative cells from the owning seq and retag
-                    // the winner's cells (attn cells by range; recurrent tail by share/cow) onto it.
-                    const llama_pos      p0   = slot.spec_pos_root + 1;
-                    const llama_pos      p1   = slot.spec_pos_root + (llama_pos) accepted.size() - 1;
-                    const llama_seq_id   sib  = (llama_seq_id) (slot.spec_sib_base + winner_chain - 1);
-                    llama_memory_t       mem  = llama_get_memory(slot.ctx_tgt);
-
-                    slot.mem.seq_rm(slot.id, p0, -1);
-                    llama_memory_seq_cp(mem, sib, slot.id, p0, p1 + 1);
-
-                    common_sampler_copy(smpl_winner.get(), slot.smpl.get());
+                    // commit the winner via checkpoint restore + replay. the target ctx has hybrid
+                    // (recurrent) memory: chain 0's rejection rollback inside accept_rows already
+                    // consumed the single-per-round RS rollback window (llama_memory_recurrent::seq_rm
+                    // rejects a second partial rm while one is pending), and retagging the winner's
+                    // rows onto the slot seq cannot migrate the winner's own pending rollback either.
+                    // restoring the pre-verify checkpoint (root-complete state, pos_max = spec_pos_root)
+                    // and replaying the winner's accepted tokens as the next draft is master's escape
+                    // hatch for partial acceptance - exact state, costs one re-verification round.
+                    restore_replay(std::move(accepted));
 
                     if (trace > 0) {
-                        SLT_INF(slot, "accepted %2zu/%zu draft tokens (chain %d)\n", accepted.size() - 1, slot.spec_draft.size(), winner_chain);
+                        SLT_INF(slot, "committed chain %d winner via replay (%zu tokens)\n", winner_chain, slot.spec_draft.size());
                     }
+
+                    return;
                 }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
