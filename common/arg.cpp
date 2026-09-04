@@ -4202,11 +4202,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-chain-p-thresh"}, "N",
         string_format("multi-chain: spawn sibling chains only when the draft root p(top-1) is below this threshold (0 = spawn always, default: %g)", params.speculative.draft.chain_p_thresh),
-        [](common_params & params, float value) {
-            if (value < 0.0f || value > 1.0f) {
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
                 throw std::invalid_argument("invalid value (expected 0.0-1.0)");
             }
-            params.speculative.draft.chain_p_thresh = value;
+            params.speculative.draft.chain_p_thresh = v;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN_P_THRESH"));
     add_opt(common_arg(
