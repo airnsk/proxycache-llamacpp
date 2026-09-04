@@ -3172,7 +3172,7 @@ private:
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)) ||
-                    spec_n_chains > 1; // multi-chain: the winner commit replays from the pre-verify checkpoint every round
+                    (spec_n_chains > 1 && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS); // multi-chain without an RS rollback window: the winner commit needs the per-round checkpoint
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
@@ -3181,6 +3181,9 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                    //const int64_t t_total = ggml_time_us() - t_start;
+                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -4108,14 +4111,64 @@ private:
                 }
 
                 if (winner_chain > 0) {
-                    // commit the winner via checkpoint restore + replay. the target ctx has hybrid
-                    // (recurrent) memory: chain 0's rejection rollback inside accept_rows already
-                    // consumed the single-per-round RS rollback window (llama_memory_recurrent::seq_rm
-                    // rejects a second partial rm while one is pending), and retagging the winner's
-                    // rows onto the slot seq cannot migrate the winner's own pending rollback either.
-                    // restoring the pre-verify checkpoint (root-complete state, pos_max = spec_pos_root)
-                    // and replaying the winner's accepted tokens as the next draft is master's escape
-                    // hatch for partial acceptance - exact state, costs one re-verification round.
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                        // commit the winner with ONE recurrent-state rollback on the owning seq
+                        // instead of a full-state CPU checkpoint restore. the previous version
+                        // saved a 149 MiB checkpoint EVERY round just to enable checkpoint restore
+                        // here (measured Q3_K_XL c2: 24 saves x 192.8 ms = 4.7 s of 7.6 s eval,
+                        // winner fired in 1 of 25 rounds). with the RS window (n_rs_seq == draft
+                        // n_max >= chain 0's draft count) a single partial rollback to the root
+                        // state is exact, and the winner's tokens replay through the normal
+                        // verify path next round (is_replay). this early return skips the commit
+                        // tail's rollback, so the round's single-use window stays free for us.
+                        // move the MTP carryover (pending_h) to the winner's last accepted row and
+                        // drop chain 0's speculative cells from ctx_dft - the same bookkeeping the
+                        // normal commit does; skipping it would leak the loser chain's draft state
+                        common_speculative_accept_chain(spec.get(), slot.id, accepted.size() - 1, winner_chain);
+
+                        // mirror master's commit invariant: prompt covers everything up to the new
+                        // root token, slot.sampled holds the (already sampled) root and spec_draft
+                        // holds the remaining winner tokens to be re-verified next round
+                        slot.spec_is_replay = true;
+                        slot.sampled = accepted[0];
+                        slot.spec_draft.assign(std::next(accepted.begin()), accepted.end());
+
+                        // drop chain 0's speculative draft rows; the root row stays decoded
+                        slot.mem.seq_rm(slot.id, slot.spec_pos_root + 1, -1);
+                        slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+
+                        // rewind the sampler to the pre-verification state, then accept the new root
+                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        common_sampler_accept(slot.smpl.get(), accepted[0], true);
+
+                        // the new root token is emitted now, like ids.back() is in the normal
+                        // commit path (it stays out of the prompt until the next round's batch)
+                        {
+                            completion_token_output result;
+                            result.tok          = accepted[0];
+                            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                            result.prob         = 1.0f;
+
+                            slot.stats.n_gen += 1;
+
+                            if (!process_token(result, slot)) {
+                                slot.print_timings();
+                                send_final_response(slot);
+                                slot.release();
+
+                                return;
+                            }
+                        }
+
+                        if (trace > 0) {
+                            SLT_INF(slot, "committed chain %d winner via rollback+replay (%zu draft tokens)\n",
+                                    winner_chain, slot.spec_draft.size());
+                        }
+
+                        return;
+                    }
+
+                    // no RS rollback window for this ctx -> restore the per-round checkpoint
                     restore_replay(std::move(accepted));
 
                     if (trace > 0) {
