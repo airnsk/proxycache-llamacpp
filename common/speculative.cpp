@@ -1936,7 +1936,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         if (llama_decode(ctx_dft, batch) != 0) {
-            SPC_ERR("draft_multi: root llama_decode failed\n");
+            SPC_ERR("%s", "draft_multi: root llama_decode failed\n");
             return;
         }
 
@@ -2015,7 +2015,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         while (n_active > 0 && batch.n_tokens > 0) {
             if (llama_decode(ctx_dft, batch) != 0) {
-                SPC_ERR("draft_multi: llama_decode failed\n");
+                SPC_ERR("%s", "draft_multi: llama_decode failed\n");
                 break;
             }
 
