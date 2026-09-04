@@ -170,7 +170,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     }
 
     if ((uint32_t) seq_id >= this->n_seq_max) {
-        LLAMA_LOG_ERROR("SPC_RSDBG invalid seq_id (%d) - n_seq_max (%d)\n", seq_id, this->n_seq_max);
+        LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, this->n_seq_max);
         return false;
     }
 
@@ -183,7 +183,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     // of the sequence because their state isn't preserved for previous tokens
     if (seq_id >= (int64_t) size) {
         // could be fatal
-        LLAMA_LOG_ERROR("SPC_RSDBG rm_fail seq_beyond_size seq=%d size=%u used=%u\n", seq_id, size, used);
         return false;
     }
     if (0 <= seq_id) {
@@ -201,8 +200,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     cell.pos = p0 - 1;
                     return true;
                 }
-                LLAMA_LOG_ERROR("SPC_RSDBG rm_fail rollback seq=%d p0=%d tail_pos=%d rollback=%d n_rs_seq=%u pending=%d\n",
-                        seq_id, p0, cell.pos, rollback, n_rs_seq, (int) pending);
                 return false;
             }
             // invalidate tails which will be cleared
@@ -213,7 +210,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     } else {
         // seq_id is negative, then the range should include everything or nothing
         if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
-            LLAMA_LOG_ERROR("SPC_RSDBG rm_fail neg_seq seq=%d p0=%d p1=%d\n", seq_id, p0, p1);
+            //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: `seq_id` is negative, so returning false\n");
             return false;
         }
     }
