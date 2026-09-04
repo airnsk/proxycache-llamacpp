@@ -47,8 +47,22 @@ static common_speculative_output_limits server_output_limits(const common_params
     const int32_t n_draft_max = common_speculative_n_max(&params.speculative);
     const int32_t n_chains    = std::max(1, params.speculative.draft.n_chains);
 
+    if (n_chains > 1) {
+        // multi-chain verify: each slot emits n_chains output blocks of (1 root + n_draft) rows,
+        // each block on its own seq id (owning slot + siblings). per-seq stays 1 + n_draft_max,
+        // total must cover all blocks: n_parallel * n_chains * (1 + n_draft_max).
+        // (1 + n_draft_max * n_chains) undercounts by (n_chains - 1) rows -> GGML_ASSERT in
+        // llama_context output reserve on the first decode.
+        const int64_t per_seq = 1 + (int64_t) n_draft_max;
+        const int64_t total   = (int64_t) params.n_parallel * n_chains * per_seq;
+        return {
+            /* .total   = */ (int32_t) std::max<int64_t>(1, std::min<int64_t>(params.n_batch, total)),
+            /* .per_seq = */ (int32_t) std::max<int64_t>(1, std::min<int64_t>(params.n_batch, per_seq)),
+        };
+    }
+
     auto result = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, n_draft_max * n_chains);
+            params.n_batch, params.n_parallel, n_draft_max);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
