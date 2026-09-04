@@ -263,7 +263,12 @@ struct server_slot {
     // chains > 0 are decoded on dedicated sibling seq ids (spec_sib_base + c - 1).
     std::vector<llama_tokens> spec_chains;
     std::vector<std::vector<int32_t>> spec_i_batch_c;
+    std::vector<int32_t> spec_chain_idx; // spec_i_batch_c[k] belongs to chain spec_chain_idx[k]
     llama_seq_id spec_sib_base = 0;
+    llama_pos spec_pos_root = -1; // position of the verified root token in the last verification batch
+    bool spec_chains_paused = false; // hysteresis: extra chains disabled after repeated full misses
+    std::vector<uint8_t> spec_miss_win;   // sliding window: 1 = chain 0 fully rejected in that round
+    int spec_pause_left = 0;              // rounds remaining with extra chains disabled
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -394,6 +399,8 @@ struct server_slot {
             spec_i_batch.clear();
             spec_chains.clear();
             spec_i_batch_c.clear();
+            spec_chain_idx.clear();
+            spec_sib_rm();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -540,10 +547,46 @@ struct server_slot {
             }
 
             auto pos0 = prompt.tokens.pos_next();
+            const auto pos_root = pos0;
+            spec_pos_root = pos_root;
 
             add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
+            }
+
+            // multi-chain: chains > 0 are verified on dedicated sibling seq ids. each sibling
+            // block starts with a copy of the root token so its own state/KV is self-contained
+            spec_i_batch_c.clear();
+            for (size_t c = 1; c < spec_chains.size(); ++c) {
+                const auto & chain = spec_chains[c];
+                if (chain.empty()) {
+                    continue;
+                }
+
+                const llama_seq_id sib = (llama_seq_id) (spec_sib_base + (int32_t) (c - 1));
+
+                // sibling branch seq: fresh tag set = owning slot's prefix cells + shared recurrent
+                // tail (copy-on-write on this batch's decode); the root token is re-decoded below
+                if (ctx_tgt) {
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    llama_memory_seq_rm(mem, sib, 0, -1);
+                    llama_memory_seq_cp(mem, id, sib, 0, -1);
+                }
+
+                std::vector<int32_t> idxs;
+
+                idxs.push_back(batch.size());
+                add_ok &= batch.add(sib, sampled, pos_root, true, false);
+
+                auto posc = pos_root + 1;
+                for (auto token : chain) {
+                    idxs.push_back(batch.size());
+                    add_ok &= batch.add(sib, token, posc++, true, false);
+                }
+
+                spec_i_batch_c.push_back(std::move(idxs));
+                spec_chain_idx.push_back((int32_t) c);
             }
         }
 
@@ -551,6 +594,42 @@ struct server_slot {
 
         prompt.tokens.push_back(sampled);
         prompt.tokens.insert(spec_draft);
+    }
+
+    void spec_sib_rm() {
+        if (!ctx_tgt) {
+            return;
+        }
+        auto * mem = llama_get_memory(ctx_tgt);
+        for (size_t c = 1; c < spec_chains.size(); ++c) {
+            llama_memory_seq_rm(mem, (llama_seq_id) (spec_sib_base + (int32_t) (c - 1)), 0, -1);
+        }
+    }
+
+    // multi-chain hysteresis: sliding-window fraction of chain-0 full misses gates chains 2..N
+    void spec_chains_update_hysteresis(bool full_miss_chain0) {
+        if (spec_pause_left > 0) {
+            if (--spec_pause_left == 0) {
+                spec_chains_paused = false;
+                spec_miss_win.clear();
+            }
+            return;
+        }
+
+        spec_miss_win.push_back(full_miss_chain0 ? 1 : 0);
+        if (spec_miss_win.size() > 20) {
+            spec_miss_win.erase(spec_miss_win.begin());
+        }
+
+        if (spec_miss_win.size() >= 8) {
+            const int n_miss = std::count(spec_miss_win.begin(), spec_miss_win.end(), 1);
+            if ((float) n_miss / (float) spec_miss_win.size() > 0.4f) {
+                spec_chains_paused = true;
+                spec_pause_left = 10;
+                SLT_DBG(*this, "multi-chain: pausing extra chains (full-miss rate %.2f over %zu rounds)\n",
+                        (float) n_miss / (float) spec_miss_win.size(), spec_miss_win.size());
+            }
+        }
     }
 
     void release() {
@@ -1306,6 +1385,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
+            slot.spec_sib_base = (llama_seq_id) (params_base.n_parallel + i * std::max(0, spec_n_chains - 1));
             slot.n_ctx   = n_ctx_slot();
 
             slot.mctx                   = mctx;
@@ -3032,6 +3112,15 @@ private:
                             /* .result   = */ &slot.spec_draft,
                         };
 
+                        if (spec_n_chains > 1) {
+                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+
+                            dp.chains = &slot.spec_chains;
+
+                            // hysteresis: pause extra chains while the greedy chain keeps missing
+                            dp.n_chains_limit = slot.spec_chains_paused ? 1 : spec_n_chains;
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }
@@ -3793,6 +3882,14 @@ private:
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
                 }
             }
+
+            for (auto & idxs : slot.spec_i_batch_c) {
+                for (auto & i : idxs) {
+                    if (!is_inside_view(i)) {
+                        throw std::runtime_error(string_format("speculative chain batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
+                    }
+                }
+            }
         });
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
@@ -3910,14 +4007,111 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
-                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+
+                // replay the accepted prefix through the next round (restore the checkpoint and
+                // re-verify the accepted tokens as a fresh draft on the owning seq)
+                auto restore_replay = [&](llama_tokens new_draft) {
+                    GGML_ASSERT(!slot.spec_ckpt.empty());
+
+                    slot.spec_is_replay = true;
+                    slot.spec_draft = std::move(new_draft);
+
+                    const auto & ckpt = slot.spec_ckpt;
+
+                    SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                    if (slot.ctx_dft) {
+                        ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
+
+                    slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+
+                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                    common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                };
+
+                auto accept_rows = [&](const std::vector<int32_t> & idxs, const llama_tokens & draft,
+                        common_sampler * smpl) {
+                    return synth_probs.empty()
+                        ? common_sampler_sample_and_accept_n(smpl, slot.ctx_tgt, idxs, draft)
+                        : server_sample_and_accept_synth(smpl, slot.ctx_tgt, idxs, draft,
+                                synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                };
+
+                // chain 0 (greedy, owning seq) is always verified first and mirrors the single-chain path
+                auto accepted = accept_rows(slot.spec_i_batch, slot.spec_draft, slot.smpl.get());
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                const bool full_miss_chain0 = accepted.size() < 2;
+
+                // multi-chain: verify sibling chains only when needed. exact mode: fixed order,
+                // the first chain with >= 1 accepted draft token wins (early exit when chain 0 passes).
+                // approx mode (--spec-approx): evaluate all chains, pick the longest accepted prefix.
+                const bool multi = spec_n_chains > 1 && !slot.spec_chains_paused && synth_probs.empty();
+
+                int32_t winner_chain = 0;
+                common_sampler_ptr smpl_winner(nullptr);
+
+                if (multi && !slot.spec_i_batch_c.empty() && (params_base.speculative.draft.approx || full_miss_chain0)) {
+                    size_t best_len = accepted.size();
+
+                    for (size_t k = 0; k < slot.spec_i_batch_c.size(); ++k) {
+                        const int32_t c = slot.spec_chain_idx[k];
+                        GGML_ASSERT(c > 0 && c < (int32_t) slot.spec_chains.size());
+
+                        const auto & idxs     = slot.spec_i_batch_c[k];
+                        const auto & draft_c  = slot.spec_chains[c];
+
+                        GGML_ASSERT(idxs.size() == draft_c.size() + 1);
+
+                        common_sampler_ptr smpl_c(common_sampler_clone(smpl_save.get()));
+
+                        auto accepted_c = accept_rows(idxs, draft_c, smpl_c.get());
+                        GGML_ASSERT(accepted_c.size() >= 1);
+
+                        if (accepted_c.size() > best_len) {
+                            best_len      = accepted_c.size();
+                            accepted      = std::move(accepted_c);
+                            winner_chain  = c;
+                            smpl_winner.reset(common_sampler_clone(smpl_c.get()));
+                        }
+
+                        if (!params_base.speculative.draft.approx && winner_chain > 0) {
+                            break; // exact mode: first passing sibling chain wins
+                        }
+                    }
+                }
+
+                if (multi) {
+                    slot.spec_chains_update_hysteresis(full_miss_chain0);
+
+                    slot.spec_chains.clear();
+                    slot.spec_i_batch_c.clear();
+                    slot.spec_chain_idx.clear();
+                }
+
+                if (winner_chain > 0) {
+                    // commit the winner in place: its rows share positions with chain 0's speculative
+                    // rows (same root). drop chain 0's speculative cells from the owning seq and retag
+                    // the winner's cells (attn cells by range; recurrent tail by share/cow) onto it.
+                    const llama_pos      p0   = slot.spec_pos_root + 1;
+                    const llama_pos      p1   = slot.spec_pos_root + (llama_pos) accepted.size() - 1;
+                    const llama_seq_id   sib  = (llama_seq_id) (slot.spec_sib_base + winner_chain - 1);
+                    llama_memory_t       mem  = llama_get_memory(slot.ctx_tgt);
+
+                    slot.mem.seq_rm(slot.id, p0, -1);
+                    llama_memory_seq_cp(mem, sib, slot.id, p0, p1 + 1);
+
+                    common_sampler_copy(smpl_winner.get(), slot.smpl.get());
+
+                    if (trace > 0) {
+                        SLT_INF(slot, "accepted %2zu/%zu draft tokens (chain %d)\n", accepted.size() - 1, slot.spec_draft.size(), winner_chain);
+                    }
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -3925,41 +4119,25 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
 
-                // check for partial draft acceptance
-                if (n_rollback > 0) {
+                // check for partial draft acceptance (the winner was already committed above)
+                if (winner_chain == 0 && n_rollback > 0) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
-                        slot.spec_is_replay = true;
-                        slot.spec_draft = std::move(accepted);
-
-                        const auto & ckpt = slot.spec_ckpt;
-
-                        SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
-
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                        if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
-
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
-
-                        slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        restore_replay(std::move(accepted));
 
                         return;
                     }
                 }
 
-                if (trace > 0) {
+                if (trace > 0 && winner_chain == 0) {
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept_chain(spec.get(), slot.id, accepted.size() - 1, winner_chain);
 
                 slot.spec_draft = std::move(accepted);
             }
