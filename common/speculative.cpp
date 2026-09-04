@@ -1368,6 +1368,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // position of the last verification block's root row per owning seq (multi-chain bookkeeping)
+    std::vector<llama_pos>          i_root_pos;
+
     // multi-chain: number of draft chains generated per seq (1 = single chain, bit-for-bit legacy).
     // only supported for the single-head, non-shared-MEM MTP path with CPU draft sampling (qwen35).
     // per-seq state (pending_h, smpls, verify_h, i_last, ...) is indexed flat: seq_id*n_chains + chain.
@@ -1488,6 +1491,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_flat, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_flat, -1);
+        i_root_pos.assign(n_seq, -1);
         i_batch_beg.assign(n_flat, -1);
         i_batch_end.assign(n_flat, -1);
 
@@ -1677,6 +1681,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[f] - i_batch_beg[f] + 1;
+
+            if (f % n_chains == 0) {
+                i_root_pos[f / n_chains] = batch_in.pos[i_batch_beg[f]];
+            }
+
             verify_h_rows[f] = n_rows;
             verify_h[f].resize((size_t) n_rows * n_embd);
 
@@ -1901,7 +1910,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             GGML_ASSERT(dp.chains != nullptr);
 
-            dp.chains->resize(n_chains);
+            const int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
+
+            dp.chains->resize(n_chains_cur);
             for (auto & ch : *dp.chains) {
                 ch.clear();
             }
@@ -1964,7 +1975,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 last_row[f0] = batch.n_tokens - 1;
             }
 
-            for (int32_t c = 1; c < n_chains; ++c) {
+            const int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
+
+            for (int32_t c = 1; c < n_chains_cur; ++c) {
                 if ((size_t) c >= cur_p->size) {
                     continue; // not enough distinct candidates - fewer chains this round
                 }
@@ -2015,7 +2028,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                for (int32_t c = 0; c < n_chains; ++c) {
+                const int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
+
+                for (int32_t c = 0; c < n_chains_cur; ++c) {
                     const int32_t f = flat_idx(seq_id, c);
 
                     if (!active[f]) {
@@ -2137,6 +2152,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[flat_idx(seq_id, 0)].data(), verify_h[f].data() + (size_t) i_h * n_embd, row_bytes);
+
+        if (chain > 0 && i_root_pos[seq_id] >= 0) {
+            // the owning draft seq carries chain 0's speculative cells beyond the root - drop them
+            llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, i_root_pos[seq_id], -1);
+        }
     }
 };
 

@@ -61,6 +61,10 @@ struct common_speculative_draft_params {
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;
 
+    // multi-chain: cap the number of chains generated this round (-1 = use the configured value).
+    // lets the caller disable extra chains dynamically (e.g. hysteresis after repeated misses)
+    int32_t n_chains_limit = -1;
+
     llama_pos   n_past;
     llama_token id_last;
 
