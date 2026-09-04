@@ -1378,9 +1378,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // n_seq + seq_id*(n_chains-1) + (c-1) in both ctx_dft and ctx_tgt.
     int32_t n_chains = 1;
 
+    // multi-chain ngram seeding (--spec-ngram-chain): chain 1 is seeded from an ngram-lookup
+    // draft over the slot history (common_ngram_simple_draft) instead of branching on the MTP
+    // top-2 candidate; the rest of the chain continues greedily on MTP. chains >= 2 stay MTP.
+    bool     ng_chain = false;
+    uint16_t ng_size_n = 12;
+    uint16_t ng_size_m = 24;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
+        , ng_size_n(params.ngram_simple.size_n)
+        , ng_size_m(params.ngram_simple.size_m)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1439,7 +1448,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         // multi-chain speculation setup (see n_chains comment above)
-        n_chains = std::max(1, (int) this->params.n_chains);
+        n_chains  = std::max(1, (int) this->params.n_chains);
+        ng_chain  = this->params.ngram_chain && n_chains > 1;
         if (n_chains > 1 && (chain_heads || is_mem_shared || this->params.backend_sampling)) {
             SPC_WRN("n_chains=%d is only supported for the single-head MTP path with CPU draft "
                     "sampling (chain_heads=%d, is_mem_shared=%d, backend_sampling=%d) - falling back to 1 chain\n",
@@ -1931,6 +1941,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::vector<int32_t>     last_row(n_flat, -1);
         std::vector<llama_pos>   pos_next(n_flat, 0);
 
+        // per-seq ngram draft for chain 1 (when ng_chain), with the next unconsumed index
+        std::vector<llama_tokens> ng(n_seq);
+        std::vector<size_t>       ng_pos(n_seq, 0);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -2008,13 +2022,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
 
             for (int32_t c = 1; c < n_chains_cur; ++c) {
-                if ((size_t) c >= cur_p->size) {
-                    continue; // not enough distinct candidates - fewer chains this round
-                }
-
                 const int32_t    f  = flat_idx(seq_id, c);
                 const llama_seq_id sib = chain_seq_id(seq_id, c);
-                const llama_token idc = cur_p->data[c].id;
+
+                llama_token idc;
+
+                if (ng_chain && c == 1) {
+                    // chain 1 from the ngram lookup draft; skip the branch when it would only
+                    // duplicate the greedy chain 0 seed or there is no match at all
+                    auto & ngd = ng[seq_id];
+                    if (ngd.empty()) {
+                        common_ngram_simple_config ngc;
+                        ngc.size_ngram = ng_size_n;
+                        ngc.size_mgram = dp.n_max > 0 ? std::min<uint16_t>(ng_size_m, (uint16_t) dp.n_max)
+                                                      : ng_size_m;
+                        ngd = common_ngram_simple_draft(ngc, *dp.prompt, dp.id_last);
+                    }
+                    if (ngd.empty() || ngd.front() == cur_p->data[0].id) {
+                        continue;
+                    }
+                    idc = ngd.front();
+                    ng_pos[seq_id] = 1; // the seed token is consumed below
+                } else {
+                    if ((size_t) c >= cur_p->size) {
+                        continue; // not enough distinct candidates - fewer chains this round
+                    }
+                    idc = cur_p->data[c].id;
+                }
 
                 common_sampler_reset(smpls[f].get());
                 common_sampler_accept(smpls[f].get(), idc, true);
@@ -2079,9 +2113,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         continue;
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    llama_token id;
+                    bool        forced = false;
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    if (ng_chain && c == 1 && ng_pos[seq_id] < ng[seq_id].size()) {
+                        id = ng[seq_id][ng_pos[seq_id]++];
+                        forced = true;
+                    } else {
+                        id = cur_p->data[0].id;
+                    }
+
+                    if (!forced && cur_p->data[0].p < params.p_min) {
                         active[f] = false;
                         n_active--;
                         continue;

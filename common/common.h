@@ -328,6 +328,7 @@ struct common_params_speculative_draft {
 
     int32_t n_chains = 1; // number of draft chains verified in one batch (multi-chain speculation, 1 = single chain)
     bool    approx       = false; // multi-chain: pick the longest accepted prefix instead of first-passing chain (approximate decoding)
+    bool    ngram_chain  = false; // multi-chain: seed chain 1 with an ngram-lookup draft (from prompt history) instead of the MTP top-2 candidate
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)

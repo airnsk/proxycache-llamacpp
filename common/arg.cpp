@@ -4174,6 +4174,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAINS"));
     add_opt(common_arg(
+        {"--spec-ngram-chain"}, "[on|off]",
+        "multi-chain: seed chain 1 with an ngram-lookup draft from the slot history instead of the MTP top-2 candidate (uses --spec-ngram-simple-size-n/m for the lookup)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.speculative.draft.ngram_chain = true;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.ngram_chain = false;
+            } else {
+                throw std::invalid_argument(string_format("unknown value for --spec-ngram-chain: '%s'", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_CHAIN"));
+    add_opt(common_arg(
         {"--spec-approx"}, "[on|off]",
         "multi-chain: accept the chain with the longest accepted prefix instead of the first passing chain (approximate decoding, default: off)",
         [](common_params & params, const std::string & value) {
