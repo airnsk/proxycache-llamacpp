@@ -1594,6 +1594,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
+            if (n_chains == 1) {
+                // exact pre-multi-chain (legacy) catch-up: the per-row pairing below changed
+                // drafts at chains==1 on the server (bisect: 8cc964980 acc 0.70370/34.2 tps ->
+                // db8d4c474 acc 0.62069, same bench, nothing else differed). single-chain keeps
+                // master behavior bit-for-bit until the divergence is understood.
+                for (int k = 0; k < n_tokens; ++k) {
+                    if (batch_in.n_seq_id[k] == 1) {
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                    } else {
+                        std::vector<llama_seq_id> tags(batch_in.seq_id[k], batch_in.seq_id[k] + batch_in.n_seq_id[k]);
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], tags, 0);
+                    }
+                }
+
+                // shift the tgt embeddings to the right by one position
+                {
+                    const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens - 1));
+                }
+
+                // fill the pending embeddings from a previous run
+                for (int32_t f = 0; f < n_flat; ++f) {
+                    if (i_batch_beg[f] < 0) {
+                        continue;
+                    }
+                    std::memcpy(batch.embd + (size_t) i_batch_beg[f] * n_embd, pending_h[f].data(), row_bytes);
+                }
+
+            } else {
             // sibling-chain rows are not replayed into ctx_dft: their draft KV is rebuilt
             // from scratch each round in draft_multi (rm + seq_cp of the owning prefix)
             for (int k = 0; k < n_tokens; ++k) {
@@ -1642,6 +1671,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     k_prev = k;
                 }
             }
+            } // n_chains == 1 / multi-chain catch-up variants
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
