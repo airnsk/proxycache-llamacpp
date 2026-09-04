@@ -4187,6 +4187,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_CHAIN"));
     add_opt(common_arg(
+        {"--spec-chain-branch"}, "[on|off]",
+        "multi-chain: siblings share the top-1 root token and branch on the next draft step distribution instead of the sharp root top-k tail (incompatible with --spec-ngram-chain, which wins if both are set)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.speculative.draft.chain_branch = true;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.chain_branch = false;
+            } else {
+                throw std::invalid_argument(string_format("unknown value for --spec-chain-branch: '%s'", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN_BRANCH"));
+    add_opt(common_arg(
         {"--spec-approx"}, "[on|off]",
         "multi-chain: accept the chain with the longest accepted prefix instead of the first passing chain (approximate decoding, default: off)",
         [](common_params & params, const std::string & value) {

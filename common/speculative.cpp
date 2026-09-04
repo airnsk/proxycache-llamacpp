@@ -1382,6 +1382,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // draft over the slot history (common_ngram_simple_draft) instead of branching on the MTP
     // top-2 candidate; the rest of the chain continues greedily on MTP. chains >= 2 stay MTP.
     bool     ng_chain = false;
+    // --spec-chain-branch: siblings share the top-1 root token and branch on the NEXT draft
+    // step's distribution (per-position rejects are ~uniform, the root top-k tail is flat)
+    bool     branch_chain = false;
     uint16_t ng_size_n = 12;
     uint16_t ng_size_m = 24;
 
@@ -1450,6 +1453,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // multi-chain speculation setup (see n_chains comment above)
         n_chains  = std::max(1, (int) this->params.n_chains);
         ng_chain  = this->params.ngram_chain && n_chains > 1;
+        branch_chain = this->params.chain_branch && n_chains > 1 && !ng_chain;
         if (n_chains > 1 && (chain_heads || is_mem_shared || this->params.backend_sampling)) {
             SPC_WRN("n_chains=%d is only supported for the single-head MTP path with CPU draft "
                     "sampling (chain_heads=%d, is_mem_shared=%d, backend_sampling=%d) - falling back to 1 chain\n",
@@ -2043,6 +2047,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                     idc = ngd.front();
                     ng_pos[seq_id] = 1; // the seed token is consumed below
+                } else if (branch_chain) {
+                    // shared root: seed with the same top-1 token, differentiate on the next step
+                    idc = cur_p->data[0].id;
                 } else {
                     if ((size_t) c >= cur_p->size) {
                         continue; // not enough distinct candidates - fewer chains this round
@@ -2119,6 +2126,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     if (ng_chain && c == 1 && ng_pos[seq_id] < ng[seq_id].size()) {
                         id = ng[seq_id][ng_pos[seq_id]++];
                         forced = true;
+                    } else if (branch_chain && c >= 1 && result.size() == 1) {
+                        // first step after the shared root seed - branch this step's distribution:
+                        // chain c takes candidate rank c (chain 0 keeps greedy top-1)
+                        if ((size_t) c >= cur_p->size) {
+                            result.clear(); // nothing distinct to branch on - drop the duplicate chain
+                            active[f] = false;
+                            n_active--;
+                            continue;
+                        }
+                        id = cur_p->data[c].id;
                     } else {
                         id = cur_p->data[0].id;
                     }
