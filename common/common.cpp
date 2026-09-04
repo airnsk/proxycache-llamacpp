@@ -1727,6 +1727,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // per-seq state (recurrent/hybrid models: one state buffer per seq)
     if (params.speculative.draft.n_chains > 1) {
         cparams.n_seq_max = (uint32_t) std::max(1, params.n_parallel) * (uint32_t) params.speculative.draft.n_chains;
+
+        // chain branch seqs are primed via llama_memory_seq_cp from the owning seq - supported
+        // only on a unified (meta-tagged) cache; cross-stream copies need full-buffer asserts
+        cparams.kv_unified = true;
     }
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
