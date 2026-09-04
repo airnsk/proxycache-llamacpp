@@ -2880,7 +2880,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.n_outputs_max = params.n_parallel;
+    // multi-chain: the draft ctx samples 1 output per chain seq - with chains>1 the extra
+    // n_parallel*(chains-1) sibling ids push n_seq_max above n_parallel; if n_outputs_max
+    // stays n_parallel, llama_context::output_reserve(n_seq_max) asserts in the fit pass
+    // (common_get_device_memory_data_impl -> llama_init_from_model of the extra model).
+    result.n_outputs_max = params.n_parallel * std::max(1, (int) params_spec.n_chains);
     result.n_outputs_max_per_seq = 1;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
