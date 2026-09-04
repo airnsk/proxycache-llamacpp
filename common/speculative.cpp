@@ -2009,12 +2009,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             SPC_TRC("- seq %d root p(top-1) = %.4f\n", (int) seq_id, cur_p->data[0].p);
 
-            // conditional chains (--spec-chain-p-thresh): the MTP root is confident - verify
-            // only the greedy chain this round; siblings spawn only where there is something to catch
+            // conditional chains: the MTP root is confident - verify only the greedy chain this round;
+            // siblings spawn only where there is something to catch. two gate flavors:
+            //   --spec-chain-p-thresh: absolute - gate when p(top-1) >= threshold
+            //   --spec-chain-margin:   relative - gate when p(top-1)-p(top-2) >= margin (host idea 23:17:
+            //     root distribution is bimodal, so "unsure" == two close candidates == exactly where a
+            //     second chain can win; margin separates that from "one candidate + long tail" better
+            //     than an absolute threshold). both enabled -> gate only if both say confident.
             int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
-            if (params.chain_p_thresh > 0.0f && cur_p->data[0].p >= params.chain_p_thresh) {
-                n_chains_cur = 1;
-                SPC_TRC("- seq %d gated (p >= %.2f)\n", (int) seq_id, params.chain_p_thresh);
+            if ((params.chain_p_thresh > 0.0f || params.chain_margin > 0.0f) && n_chains_cur > 1) {
+                bool gate = true;
+                if (params.chain_p_thresh > 0.0f && cur_p->data[0].p < params.chain_p_thresh) {
+                    gate = false;
+                }
+                if (params.chain_margin > 0.0f) {
+                    const float p2 = cur_p->size > 1 ? cur_p->data[1].p : 0.0f;
+                    SPC_TRC("- seq %d root margin = %.4f\n", (int) seq_id, cur_p->data[0].p - p2);
+                    if (cur_p->data[0].p - p2 < params.chain_margin) {
+                        gate = false;
+                    }
+                }
+                if (gate) {
+                    n_chains_cur = 1;
+                    SPC_TRC("- seq %d gated\n", (int) seq_id);
+                }
             }
 
             const float * h_root = llama_get_embeddings_nextn_ith(ctx_dft, last_row[f0]);

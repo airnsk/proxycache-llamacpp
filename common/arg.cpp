@@ -4211,6 +4211,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN_P_THRESH"));
     add_opt(common_arg(
+        {"--spec-chain-margin"}, "N",
+        string_format("multi-chain: spawn sibling chains only when root p(top-1)-p(top-2) is below this margin (0 = spawn always, default: %g); stricter than the absolute threshold when the MTP root distribution is bimodal", params.speculative.draft.chain_margin),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("invalid value (expected 0.0-1.0)");
+            }
+            params.speculative.draft.chain_margin = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN_MARGIN"));
+    add_opt(common_arg(
         {"--spec-approx"}, "[on|off]",
         "multi-chain: accept the chain with the longest accepted prefix instead of the first passing chain (approximate decoding, default: off)",
         [](common_params & params, const std::string & value) {
