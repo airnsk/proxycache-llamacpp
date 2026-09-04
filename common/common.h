@@ -330,6 +330,7 @@ struct common_params_speculative_draft {
     bool    approx       = false; // multi-chain: pick the longest accepted prefix instead of first-passing chain (approximate decoding)
     bool    ngram_chain  = false; // multi-chain: seed chain 1 with an ngram-lookup draft (from prompt history) instead of the MTP top-2 candidate
     bool    chain_branch = false; // multi-chain: siblings share the top-1 root token and branch on the NEXT step distribution (per-position reject data) instead of the sharp root top-k tail
+    float   chain_p_thresh = 0.0f; // multi-chain: spawn sibling chains only when the draft root p(top-1) is below this threshold (0 = spawn always)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)

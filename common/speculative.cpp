@@ -2007,6 +2007,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue; // even the best candidate is too weak - skip all chains
             }
 
+            SPC_TRC("- seq %d root p(top-1) = %.4f\n", (int) seq_id, cur_p->data[0].p);
+
+            // conditional chains (--spec-chain-p-thresh): the MTP root is confident - verify
+            // only the greedy chain this round; siblings spawn only where there is something to catch
+            int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
+            if (params.chain_p_thresh > 0.0f && cur_p->data[0].p >= params.chain_p_thresh) {
+                n_chains_cur = 1;
+                SPC_TRC("- seq %d gated (p >= %.2f)\n", (int) seq_id, params.chain_p_thresh);
+            }
+
             const float * h_root = llama_get_embeddings_nextn_ith(ctx_dft, last_row[f0]);
 
             // chain 0: greedy top-1 on the owning seq (same token / same order as the single-chain path)
@@ -2022,8 +2032,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 last_row[f0] = batch.n_tokens - 1;
             }
-
-            const int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
 
             for (int32_t c = 1; c < n_chains_cur; ++c) {
                 const int32_t    f  = flat_idx(seq_id, c);
@@ -2099,6 +2107,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // gated siblings were never marked active above - the active[] check below skips them
                 const int32_t n_chains_cur = dp.n_chains_limit > 0 ? std::min(n_chains, dp.n_chains_limit) : n_chains;
 
                 for (int32_t c = 0; c < n_chains_cur; ++c) {
