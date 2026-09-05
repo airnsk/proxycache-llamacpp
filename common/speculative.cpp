@@ -2228,17 +2228,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     break;
                 }
             }
-
-            // TEMP DIAG (temp0 divergence hunt): dump every chain's drafted token ids per round
-            {
-                for (int32_t c = 0; c < (int32_t) dp.chains->size(); ++c) {
-                    std::string ids_str;
-                    for (auto tid : dp.chains->at(c)) {
-                        ids_str += std::to_string(tid) + " ";
-                    }
-                    SPC_TRC("- seq %d chain %d draft: [%s]\n", (int) seq_id, c, ids_str.c_str());
-                }
-            }
         }
     }
 
