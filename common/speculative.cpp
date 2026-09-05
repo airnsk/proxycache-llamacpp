@@ -2068,6 +2068,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                                                       : ng_size_m;
                         ngd = common_ngram_simple_draft(ngc, *dp.prompt, dp.id_last);
                     }
+                    // TEMP DIAG (het seed hunt): which branch kills the ngram seed?
+                    SPC_TRC("- seq %d chain1 seed: %s (ngd=%zu, greedy=%d, front=%d)\n", (int) seq_id,
+                            ngd.empty() ? "empty" : (ngd.front() == cur_p->data[0].id ? "dedup" : "ok"),
+                            ngd.size(), cur_p->data[0].id, ngd.empty() ? -1 : ngd.front());
+
                     if (ngd.empty() || ngd.front() == cur_p->data[0].id) {
                         continue;
                     }
