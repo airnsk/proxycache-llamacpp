@@ -231,6 +231,11 @@ public:
     uint64_t n_bytes()   const;  // sum of payload_bytes over the entries of this namespace
     uint64_t root_bytes() const; // size of the whole cache root as seen at open/top-up time
 
+    // cumulative counters of this namespace (stage 7: the server scrapes them instead of guessing
+    // from n_entries(), which stays flat when a save immediately triggers an eviction)
+    uint64_t n_new_writes_total() const;
+    uint64_t n_evictions_total()  const;
+
     // candidate search: one pass over the request tokens (rolling hash), then the short list is
     // verified against the exact token array from states/<id>.meta; only an entry whose tokens are
     // an exact prefix of `tokens` is usable, and then LCP = entry.n_tokens
@@ -356,4 +361,7 @@ private:
     uint64_t root_bytes_ = 0;
 
     mutable std::unordered_map<uint64_t, int> inflight; // id -> number of readers
+
+    uint64_t new_writes_total_ = 0; // entries actually written (a dedup hit does not count)
+    uint64_t evictions_total_  = 0; // entries dropped by the size limit / explicit eviction
 };

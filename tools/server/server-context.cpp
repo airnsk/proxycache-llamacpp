@@ -1799,7 +1799,7 @@ private:
 
         server_disk_cache_extra extra = disk_cache_make_extra(slot);
 
-        const size_t n_before = disk_cache->n_entries();
+        const uint64_t w_before = disk_cache->n_new_writes_total();
         const int64_t t_start = ggml_time_us();
 
         const uint64_t id = disk_cache->save(slot.ctx_tgt, slot.id, tokens, std::move(extra));
@@ -1811,7 +1811,7 @@ private:
             return false;
         }
 
-        if (disk_cache->n_entries() > n_before) {
+        if (disk_cache->n_new_writes_total() > w_before) {
             server_disk_cache_entry entry;
             if (disk_cache->entry_info(id, entry)) {
                 metrics.disk_cache_writes++;
@@ -1862,7 +1862,7 @@ private:
             extra.ckpt.push_back(std::move(blob));
         }
 
-        const size_t n_before = disk_cache->n_entries();
+        const uint64_t w_before = disk_cache->n_new_writes_total();
         const int64_t t_start = ggml_time_us();
 
         const uint64_t id = disk_cache->save_raw(state.prompt.tokens.get_tokens(), state.data.main, std::move(extra));
@@ -1874,7 +1874,7 @@ private:
             return;
         }
 
-        if (disk_cache->n_entries() > n_before) {
+        if (disk_cache->n_new_writes_total() > w_before) {
             metrics.disk_cache_writes++;
             server_disk_cache_entry entry;
             if (disk_cache->entry_info(id, entry)) {

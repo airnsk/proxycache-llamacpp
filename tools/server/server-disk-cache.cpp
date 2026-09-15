@@ -544,6 +544,16 @@ uint64_t server_disk_cache::root_bytes() const {
     return root_bytes_;
 }
 
+uint64_t server_disk_cache::n_new_writes_total() const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return new_writes_total_;
+}
+
+uint64_t server_disk_cache::n_evictions_total() const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return evictions_total_;
+}
+
 std::string server_disk_cache::summary() const {
     std::lock_guard<std::mutex> lock(mtx);
     return dc_format("namespace = '%s', %zu states, %.1f MiB payload, root %.1f MiB",
@@ -1198,6 +1208,7 @@ uint64_t server_disk_cache::save_impl(const std::vector<llama_token> & tokens,
 
     index_add(entry);
     root_bytes_ += entry.payload_bytes;
+    new_writes_total_++;
 
     if (!save_index()) {
         LOG_WRN("%s", "disk cache: index update failed, the entry stays on disk and will be picked up by a rebuild\n");
@@ -1551,6 +1562,7 @@ size_t server_disk_cache::remove_many(const std::vector<uint64_t> & ids) {
         n_bytes_    -= std::min<uint64_t>(n_bytes_, e.payload_bytes);
         LOG_INF("disk cache: evicted entry %llu (%lld bytes freed)\n", (unsigned long long) e.id, (long long) freed);
         done++;
+        evictions_total_++;
     }
 
     if (done > 0) {
