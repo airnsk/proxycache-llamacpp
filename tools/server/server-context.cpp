@@ -3025,6 +3025,7 @@ private:
 
                     // Stage 5: gauge, sampled when the metrics are scraped
                     metrics.disk_cache_index_entries = disk_cache_enabled() ? disk_cache->n_entries() : 0;
+                    metrics.disk_cache_evictions     = disk_cache_enabled() ? disk_cache->n_evictions_total() : 0;
 
                     res->metrics             = metrics;
 
