@@ -1511,6 +1511,7 @@ private:
             dcfg.size_limit_bytes = (uint64_t) std::max<int64_t>(0, params_base.cache_disk_size);
             dcfg.read_mbps        = params_base.cache_disk_read_mbps;
             dcfg.min_gain_ms      = params_base.cache_disk_min_gain_ms;
+            dcfg.min_tokens       = params_base.cache_disk_min_tokens;
             dcfg.prefill_tps      = params_base.cache_prefill_tps;
 
             disk_cache = std::make_unique<server_disk_cache>(dcfg, fp);
@@ -1787,6 +1788,15 @@ private:
 
         const llama_tokens tokens = slot.prompt.tokens.get_tokens();
 
+        // Stage 6: a state costs disk space and a write regardless of how long the prompt is, so a
+        // short prompt can never pay that back - it is not persisted at all.
+        const int32_t min_tokens = disk_cache->config().min_tokens;
+        if (min_tokens > 0 && (int32_t) tokens.size() < min_tokens) {
+            SRV_TRC("disk cache: prompt of %zu tokens is below --cache-disk-min-tokens (%d), not stored\n",
+                    tokens.size(), min_tokens);
+            return false;
+        }
+
         server_disk_cache_extra extra = disk_cache_make_extra(slot);
 
         const size_t n_before = disk_cache->n_entries();
@@ -1828,6 +1838,10 @@ private:
             return;
         }
         if (state.prompt.tokens.empty() || state.data.main.empty()) {
+            return;
+        }
+        if (disk_cache->config().min_tokens > 0 &&
+            (int32_t) state.prompt.tokens.size() < disk_cache->config().min_tokens) {
             return;
         }
 
@@ -1909,6 +1923,15 @@ private:
         server_disk_cache_candidate cand_disk;
         if (!disk_cache->find(task.tokens.get_tokens(), cand_disk)) {
             metrics.disk_cache_misses++;
+            return;
+        }
+
+        // entries left by an older build (before --cache-disk-min-tokens existed) are as useless as
+        // if they had never been written
+        if (cfg.min_tokens > 0 && (int32_t) cand_disk.n_tokens < cfg.min_tokens) {
+            metrics.disk_cache_misses++;
+            SRV_TRC("disk cache: candidate of %zu tokens is below --cache-disk-min-tokens (%d), ignored\n",
+                    cand_disk.n_tokens, cfg.min_tokens);
             return;
         }
 
@@ -4346,7 +4369,9 @@ private:
                 // state should be persisted once the slot stops processing. Saving right here would
                 // delay the first token; waiting for the next task meant a single request was never
                 // written to disk. A client that disabled prompt reuse is not persisted either.
-                slot.disk_save_pending = slot.task->params.cache_prompt;
+                slot.disk_save_pending = slot.task->params.cache_prompt &&
+                    (disk_cache->config().min_tokens <= 0 ||
+                     (int32_t) slot.prompt.tokens.size() >= disk_cache->config().min_tokens);
 
                 // Stage 5: refresh the prefill-throughput estimate from this real measurement
                 if (slot.stats.is_set() && slot.stats.n_prompt_processed > 0 && slot.stats.t_prompt_ms() > 0.0) {

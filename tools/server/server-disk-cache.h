@@ -102,6 +102,7 @@ struct server_disk_cache_config {
     uint64_t    size_limit_bytes = 500ull * 1024 * 1024 * 1024;  // --cache-disk-size (whole root)
     int32_t     read_mbps        = 200;                          // --cache-disk-read-mbps (decimal MB/s)
     int32_t     min_gain_ms      = 1000;                         // --cache-disk-min-gain-ms
+    int32_t     min_tokens       = 1024;                         // --cache-disk-min-tokens: shorter prompts are never written
     int32_t     prefill_tps      = 0;                            // --cache-prefill-tps (0 = auto)
 };
 
