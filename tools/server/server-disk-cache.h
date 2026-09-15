@@ -259,6 +259,13 @@ public:
     // return the extra sections, if the caller asks for them
     bool load(llama_context * ctx_tgt, llama_seq_id seq_id, uint64_t id, server_disk_cache_extra * extra_out);
 
+    // Lifecycle guard (stage 6): an entry that is being read is never unlinked by eviction.
+    // The internal lock is expected to be held (every read path holds it); the pair is public so
+    // tests can pin an entry and check that eviction walks around it.
+    void begin_read(uint64_t id) const;
+    void end_read(uint64_t id) const;
+    size_t n_inflight() const;
+
     // full payload read-back, for tests and debugging (keeps the whole payload in RAM)
     bool read_payload(uint64_t id, std::vector<uint8_t> & main_out, server_disk_cache_extra * extra_out) const;
 
@@ -321,6 +328,9 @@ private:
 
     uint64_t index_add_payload_bytes(uint64_t delta);
 
+    size_t remove_many(const std::vector<uint64_t> & ids); // one pass + one index rebuild
+    std::vector<uint64_t> lru_ids() const;                 // ids ordered by last_used (oldest first)
+
     int64_t  remove_files(uint64_t id) const;  // returns the freed bytes, -1 on error
     uint64_t dir_bytes(const std::string & dir) const;
     void     enforce_limit();
@@ -344,4 +354,6 @@ private:
     uint64_t next_id    = 1;
     uint64_t n_bytes_   = 0;
     uint64_t root_bytes_ = 0;
+
+    mutable std::unordered_map<uint64_t, int> inflight; // id -> number of readers
 };

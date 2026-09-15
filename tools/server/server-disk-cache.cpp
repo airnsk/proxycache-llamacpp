@@ -1273,14 +1273,47 @@ bool server_disk_cache::payload_read(uint64_t id, const server_disk_cache_entry 
     return true;
 }
 
+void server_disk_cache::begin_read(uint64_t id) const {
+    // lifecycle guard (stage 6): an entry that is being read must not be unlinked by eviction.
+    // The caller holds mtx (every read path holds it).
+    inflight[id]++;
+}
+
+void server_disk_cache::end_read(uint64_t id) const {
+    const auto it = inflight.find(id);
+    if (it != inflight.end() && --it->second <= 0) {
+        inflight.erase(it);
+    }
+}
+
+size_t server_disk_cache::n_inflight() const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return inflight.size();
+}
+
 bool server_disk_cache::read_payload(uint64_t id, std::vector<uint8_t> & main_out, server_disk_cache_extra * extra_out) const {
     std::lock_guard<std::mutex> lock(mtx);
 
+    begin_read(id);
+
     server_disk_cache_entry entry;
     if (!meta_read(id, entry, nullptr)) {
+        end_read(id);
         return false;
     }
-    return payload_read(id, entry, &main_out, extra_out);
+    const bool ok = payload_read(id, entry, &main_out, extra_out);
+    end_read(id);
+    return ok;
+}
+
+namespace {
+// pins an entry for the duration of a read (stage 6): eviction walks around in-flight entries
+struct dc_read_guard {
+    const server_disk_cache * cache;
+    uint64_t id;
+    dc_read_guard(const server_disk_cache & c, uint64_t id_) : cache(&c), id(id_) { cache->begin_read(id); }
+    ~dc_read_guard() { cache->end_read(id); }
+};
 }
 
 bool server_disk_cache::load(llama_context * ctx_tgt, llama_seq_id seq_id, uint64_t id, server_disk_cache_extra * extra_out) {
@@ -1293,6 +1326,8 @@ bool server_disk_cache::load(llama_context * ctx_tgt, llama_seq_id seq_id, uint6
     if (!ready) {
         return false;
     }
+
+    dc_read_guard guard(*this, id);
 
     server_disk_cache_entry entry;
     if (!meta_read(id, entry, nullptr)) {
@@ -1429,6 +1464,11 @@ int64_t server_disk_cache::remove_files(uint64_t id) const {
 bool server_disk_cache::remove_entry(uint64_t id) {
     std::lock_guard<std::mutex> lock(mtx);
 
+    if (inflight.count(id) != 0) {
+        LOG_WRN("disk cache: entry %llu is being read, not removing it\n", (unsigned long long) id);
+        return false;
+    }
+
     for (size_t i = 0; i < entries.size(); ++i) {
         if (entries[i].id != id) {
             continue;
@@ -1446,29 +1486,79 @@ bool server_disk_cache::remove_entry(uint64_t id) {
 size_t server_disk_cache::evict_lru(size_t n) {
     std::lock_guard<std::mutex> lock(mtx);
 
+    if (n == 0 || entries.empty()) {
+        return 0;
+    }
+
+    std::vector<uint64_t> ids = lru_ids();
+    if (ids.size() > n) {
+        ids.resize(n);
+    }
+
+    return remove_many(ids);
+}
+
+// ids ordered by last_used, oldest first. The caller holds mtx.
+std::vector<uint64_t> server_disk_cache::lru_ids() const {
+    std::vector<std::pair<uint64_t, uint64_t>> keyed; // (last_used, id)
+    keyed.reserve(entries.size());
+    for (const auto & e : entries) {
+        keyed.emplace_back(e.last_used_unix, e.id);
+    }
+    std::sort(keyed.begin(), keyed.end());
+
+    std::vector<uint64_t> ids;
+    ids.reserve(keyed.size());
+    for (const auto & kv : keyed) {
+        ids.push_back(kv.second);
+    }
+    return ids;
+}
+
+// removes the given ids in one pass: a single index rebuild instead of one rebuild per victim.
+// The caller holds mtx. In-flight entries are skipped, never unlinked.
+size_t server_disk_cache::remove_many(const std::vector<uint64_t> & ids) {
+    if (ids.empty()) {
+        return 0;
+    }
+
+    std::unordered_map<uint64_t, char> victim;
+    victim.reserve(ids.size());
+    for (const uint64_t id : ids) {
+        victim[id] = 1;
+    }
+
     size_t done = 0;
-    while (done < n && !entries.empty()) {
-        size_t best = 0;
-        for (size_t i = 1; i < entries.size(); ++i) {
-            if (entries[i].last_used_unix < entries[best].last_used_unix) {
-                best = i;
-            }
+    std::vector<server_disk_cache_entry> keep;
+    keep.reserve(entries.size());
+
+    for (const auto & e : entries) {
+        if (victim.count(e.id) == 0) {
+            keep.push_back(e);
+            continue;
         }
-        const uint64_t id = entries[best].id;
-        const int64_t freed = remove_files(id);
-        index_remove_at(best);
+        if (inflight.count(e.id) != 0) {
+            LOG_WRN("disk cache: entry %llu is in use, eviction skipped it\n", (unsigned long long) e.id);
+            keep.push_back(e);
+            continue;
+        }
+        const int64_t freed = remove_files(e.id);
         if (freed < 0) {
-            LOG_WRN("disk cache: cannot remove entry %llu\n", (unsigned long long) id);
-            break;
+            keep.push_back(e);
+            continue;
         }
         root_bytes_ -= std::min<uint64_t>(root_bytes_, (uint64_t) freed);
-        LOG_INF("disk cache: evicted entry %llu (%lld bytes freed)\n", (unsigned long long) id, (long long) freed);
+        n_bytes_    -= std::min<uint64_t>(n_bytes_, e.payload_bytes);
+        LOG_INF("disk cache: evicted entry %llu (%lld bytes freed)\n", (unsigned long long) e.id, (long long) freed);
         done++;
     }
 
     if (done > 0) {
+        entries.swap(keep);
+        index_rebuild_lookup();
         save_index();
     }
+
     return done;
 }
 
@@ -1584,31 +1674,38 @@ bool server_prefix_candidate_prefer_disk(const server_prefix_candidate & disk,
 }
 
 void server_disk_cache::enforce_limit() {
-    if (cfg.size_limit_bytes == 0) {
-        return; // no limit
+    if (cfg.size_limit_bytes == 0 || root_bytes_ <= cfg.size_limit_bytes) {
+        return; // no limit, or already inside it
     }
 
-    size_t guard = 0;
-    while (root_bytes_ > cfg.size_limit_bytes && !entries.empty() && guard < 1000000) {
-        size_t best = 0;
-        for (size_t i = 1; i < entries.size(); ++i) {
-            if (entries[i].last_used_unix < entries[best].last_used_unix) {
-                best = i;
-            }
-        }
-        const uint64_t id = entries[best].id;
-        const int64_t freed = remove_files(id);
-        index_remove_at(best);
-        if (freed <= 0) {
+    // stage 6: the victims are picked in ONE sorted pass. The previous version scanned the whole
+    // table for every victim, which made a full eviction O(n^2).
+    std::unordered_map<uint64_t, uint64_t> size_of;
+    size_of.reserve(entries.size());
+    for (const auto & e : entries) {
+        size_of[e.id] = e.payload_bytes;
+    }
+
+    const uint64_t over = root_bytes_ - cfg.size_limit_bytes;
+    std::vector<uint64_t> victims;
+    uint64_t planned = 0;
+
+    for (const uint64_t id : lru_ids()) {
+        if (planned >= over) {
             break;
         }
-        root_bytes_ -= std::min<uint64_t>(root_bytes_, (uint64_t) freed);
-        LOG_INF("disk cache: evicted entry %llu (%lld bytes freed) to stay under the %.1f GiB limit\n",
-                (unsigned long long) id, (long long) freed, (double) cfg.size_limit_bytes / (1024.0 * 1024.0 * 1024.0));
-        guard++;
+        const auto it = size_of.find(id);
+        if (it == size_of.end()) {
+            continue;
+        }
+        planned += it->second;
+        victims.push_back(id);
     }
 
-    if (guard > 0) {
-        save_index();
+    const size_t done = remove_many(victims);
+    if (done > 0) {
+        LOG_INF("disk cache: evicted %zu entries (%llu bytes planned) to stay under the %.1f GiB limit\n",
+                done, (unsigned long long) planned,
+                (double) cfg.size_limit_bytes / (1024.0 * 1024.0 * 1024.0));
     }
 }
