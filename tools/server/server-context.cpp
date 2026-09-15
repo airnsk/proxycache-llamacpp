@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-disk-cache.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -914,6 +915,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<server_disk_cache> disk_cache;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1348,19 +1351,75 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
+                // with a disk cache, the RAM cache is the L2 of a multi-tier setup: default it to 32 GiB
+        // unless -cram/--cache-ram was set explicitly
+        const int32_t cache_ram_mib = params_base.cache_ram_mib_set
+                ? params_base.cache_ram_mib
+                : (!params_base.cache_disk.empty() ? 32768 : params_base.cache_ram_mib);
+
+        if (cache_ram_mib != 0) {
+            if (cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", cache_ram_mib);
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        // persistent disk cache (tools/server/server-disk-cache.h)
+        if (!params_base.cache_disk.empty()) {
+            server_disk_cache_fp_params fp_params;
+            server_disk_cache_fp_model(model_tgt, params_base.model.path, fp_params);
+
+            fp_params.type_k              = ggml_type_name(params_base.cache_type_k);
+            fp_params.type_v              = ggml_type_name(params_base.cache_type_v);
+            fp_params.flash_attn          = llama_flash_attn_type_name(params_base.flash_attn_type);
+            fp_params.kv_unified          = params_base.kv_unified;
+            fp_params.swa_full            = params_base.swa_full;
+            fp_params.n_ctx_checkpoints   = params_base.n_ctx_checkpoints;
+            fp_params.checkpoint_min_step = params_base.checkpoint_min_step;
+            fp_params.spec_type           = common_speculative_type_name_str(params_base.speculative.types);
+
+            for (const auto & lora : params_base.lora_adapters) {
+                const std::string sha = server_disk_cache_sha256_file(lora.path);
+                if (sha.empty()) {
+                    SRV_WRN("disk cache: cannot hash the lora adapter '%s', it is identified by path only\n", lora.path.c_str());
+                }
+                fp_params.loras.push_back(lora.path + "@" + sha);
+            }
+
+            const server_disk_cache_fingerprint fp = server_disk_cache_fp_make(fp_params);
+
+            server_disk_cache_config dcfg;
+            dcfg.root             = params_base.cache_disk;
+            dcfg.size_limit_bytes = (uint64_t) std::max<int64_t>(0, params_base.cache_disk_size);
+            dcfg.read_mbps        = params_base.cache_disk_read_mbps;
+            dcfg.min_gain_ms      = params_base.cache_disk_min_gain_ms;
+            dcfg.prefill_tps      = params_base.cache_prefill_tps;
+
+            disk_cache = std::make_unique<server_disk_cache>(dcfg, fp);
+
+            if (disk_cache->ok()) {
+                const std::string prefill = dcfg.prefill_tps > 0 ? std::to_string(dcfg.prefill_tps) + " t/s" : std::string("auto");
+                SRV_INF("disk cache: enabled, path = '%s'\n", params_base.cache_disk.c_str());
+                SRV_INF("disk cache: namespace = '%s'\n", disk_cache->dir().c_str());
+                SRV_INF("disk cache: fingerprint = %s\n", fp.hex.c_str());
+                SRV_INF("disk cache: limit = %.1f GiB (whole cache root), read speed = %d MB/s, min gain = %d ms, prefill = %s\n",
+                        (double) dcfg.size_limit_bytes / (1024.0 * 1024.0 * 1024.0), dcfg.read_mbps, dcfg.min_gain_ms, prefill.c_str());
+                SRV_INF("disk cache: %zu states, %.1f MiB on disk; RAM cache limit = %d MiB\n",
+                        disk_cache->n_entries(), (double) disk_cache->n_bytes() / (1024.0 * 1024.0), cache_ram_mib);
+            } else {
+                SRV_WRN("disk cache: disabled, cannot open '%s'\n", params_base.cache_disk.c_str());
+                disk_cache.reset();
+            }
+        } else {
+            SRV_TRC("%s", "disk cache disabled - use `--cache-disk PATH` to enable it\n");
+        }
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
