@@ -4370,7 +4370,9 @@ private:
                 // state should be persisted once the slot stops processing. Saving right here would
                 // delay the first token; waiting for the next task meant a single request was never
                 // written to disk. A client that disabled prompt reuse is not persisted either.
-                slot.disk_save_pending = slot.task->params.cache_prompt &&
+                // note: disk_cache is a nullptr unless --cache-disk is given, so the config must not
+                //       be touched without asking disk_cache_enabled() first
+                slot.disk_save_pending = disk_cache_enabled() && slot.task->params.cache_prompt &&
                     (disk_cache->config().min_tokens <= 0 ||
                      (int32_t) slot.prompt.tokens.size() >= disk_cache->config().min_tokens);
 
