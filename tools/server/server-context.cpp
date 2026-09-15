@@ -347,6 +347,10 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // Stage 6 fix: the slot holds a fully evaluated prompt that is not on disk yet. Set when the
+    // prefill completes, cleared after the deferred save in update_slots().
+    bool disk_save_pending = false;
+
     common_memory mem;
 
     // multimodal
@@ -2126,8 +2130,10 @@ private:
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
 
-            // Stage 4 4.2: resident (incl. the state just loaded from the RAM cache) vs disk
-            if (task.type == SERVER_TASK_TYPE_COMPLETION) {
+            // Stage 4 4.2: resident (incl. the state just loaded from the RAM cache) vs disk.
+            // Same gate as the regular prompt-reuse path: a client that sent "cache_prompt": false
+            // must not receive a state from the disk cache either.
+            if (task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt) {
                 disk_cache_try_restore(*ret, task);
             }
         }
@@ -3288,6 +3294,22 @@ private:
         }
 #endif
 
+        // Stage 6 fix: deferred save of a request that already finished its prefill. The write runs
+        // here, in the main loop, so the first token is not delayed and no extra request is needed
+        // to get a single request persisted.
+        if (disk_cache_enabled()) {
+            for (auto & slot : slots) {
+                if (!slot.disk_save_pending) {
+                    continue;
+                }
+                if (slot.is_processing()) {
+                    continue; // the state is still changing
+                }
+                disk_cache_save_slot(slot, "request end");
+                slot.disk_save_pending = false;
+            }
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -4319,6 +4341,12 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // Stage 6 fix: the prompt of this request is fully evaluated - remember that the
+                // state should be persisted once the slot stops processing. Saving right here would
+                // delay the first token; waiting for the next task meant a single request was never
+                // written to disk. A client that disabled prompt reuse is not persisted either.
+                slot.disk_save_pending = slot.task->params.cache_prompt;
 
                 // Stage 5: refresh the prefill-throughput estimate from this real measurement
                 if (slot.stats.is_set() && slot.stats.n_prompt_processed > 0 && slot.stats.t_prompt_ms() > 0.0) {
