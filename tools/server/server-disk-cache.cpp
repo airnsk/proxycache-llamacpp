@@ -1443,6 +1443,60 @@ bool server_disk_cache::find(const std::vector<llama_token> & tokens, server_dis
     return found;
 }
 
+// Stage 7: match by the longest common prefix (LCP) instead of requiring the whole entry to be a
+// prefix of the request. This mirrors how the RAM prompt cache picks a state
+// (server_prompt_cache::load): the best common prefix wins, the state is loaded exactly as it was
+// stored and the normal slot logic trims the difference. An entry that is longer than the request
+// is just as usable - its leading tokens are the prompt, and the surplus is dropped by the slot
+// (memory_seq_rm / context checkpoints) once the request is attached.
+bool server_disk_cache::find_best(const std::vector<llama_token> & tokens, server_disk_cache_candidate & out) const {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    if (tokens.empty()) {
+        return false;
+    }
+
+    bool found = false;
+
+    for (const server_disk_cache_entry & e : entries) {
+        if (e.n_tokens == 0 || e.payload_bytes == 0) {
+            continue;
+        }
+
+        server_disk_cache_entry have;
+        std::vector<llama_token> have_tokens;
+        if (!meta_read(e.id, have, &have_tokens)) {
+            continue;
+        }
+        if (have_tokens.size() != e.n_tokens) {
+            continue;
+        }
+
+        // how much of the request this entry can serve
+        const size_t n = have_tokens.size() < tokens.size() ? have_tokens.size() : tokens.size();
+        size_t lcp = 0;
+        while (lcp < n && have_tokens[lcp] == tokens[lcp]) {
+            ++lcp;
+        }
+        if (lcp == 0) {
+            continue;
+        }
+
+        // the longest match wins; on a tie the smaller state does, it restores faster
+        if (found && (out.lcp > lcp || (out.lcp == lcp && out.payload_bytes <= e.payload_bytes))) {
+            continue;
+        }
+
+        out.id            = e.id;
+        out.n_tokens      = e.n_tokens;
+        out.lcp           = lcp;
+        out.payload_bytes = e.payload_bytes;
+        found             = true;
+    }
+
+    return found;
+}
+
 bool server_disk_cache::touch(uint64_t id) {
     return set_last_used(id, dc_now_unix());
 }

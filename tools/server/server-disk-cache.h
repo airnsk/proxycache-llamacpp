@@ -142,6 +142,7 @@ struct server_disk_cache_entry {
 struct server_disk_cache_candidate {
     uint64_t id            = 0;
     uint64_t n_tokens      = 0;
+    uint64_t lcp           = 0; // how much of the request this entry can serve
     uint64_t payload_bytes = 0;
 };
 
@@ -240,6 +241,10 @@ public:
     // verified against the exact token array from states/<id>.meta; only an entry whose tokens are
     // an exact prefix of `tokens` is usable, and then LCP = entry.n_tokens
     bool find(const std::vector<llama_token> & tokens, server_disk_cache_candidate & out) const;
+
+    // Stage 7: the entry that shares the longest common prefix with the request. Unlike find(),
+    // the entry does not have to be a prefix of the request - it may be longer.
+    bool find_best(const std::vector<llama_token> & tokens, server_disk_cache_candidate & out) const;
 
     // exact token array of an entry, read from states/<id>.meta
     bool tokens_of(uint64_t id, std::vector<llama_token> & out) const;

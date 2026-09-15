@@ -1921,17 +1921,17 @@ private:
         server_prefix_candidate_estimate(cand_res, n_prompt, tps, read_bps);
 
         server_disk_cache_candidate cand_disk;
-        if (!disk_cache->find(task.tokens.get_tokens(), cand_disk)) {
+        if (!disk_cache->find_best(task.tokens.get_tokens(), cand_disk)) {
             metrics.disk_cache_misses++;
             return;
         }
 
         // entries left by an older build (before --cache-disk-min-tokens existed) are as useless as
         // if they had never been written
-        if (cfg.min_tokens > 0 && (int32_t) cand_disk.n_tokens < cfg.min_tokens) {
+        if (cfg.min_tokens > 0 && (int32_t) cand_disk.lcp < cfg.min_tokens) {
             metrics.disk_cache_misses++;
-            SRV_TRC("disk cache: candidate of %zu tokens is below --cache-disk-min-tokens (%d), ignored\n",
-                    cand_disk.n_tokens, cfg.min_tokens);
+            SRV_TRC("disk cache: candidate reusing %zu tokens is below --cache-disk-min-tokens (%d), ignored\n",
+                    cand_disk.lcp, cfg.min_tokens);
             return;
         }
 
@@ -1941,7 +1941,8 @@ private:
         cand.source         = SERVER_PREFIX_SOURCE_DISK;
         cand.state_id       = cand_disk.id;
         cand.n_tokens_state = cand_disk.n_tokens;
-        cand.n_tokens_match = cand_disk.n_tokens; // find() guarantees an exact prefix
+        // the common prefix is what the request actually reuses; the state covers the whole entry
+        cand.n_tokens_match = cand_disk.lcp;
         cand.restore_bytes  = cand_disk.payload_bytes;
         server_prefix_candidate_estimate(cand, n_prompt, tps, read_bps);
 
@@ -1984,9 +1985,10 @@ private:
 
         const double t_restore_s = (ggml_time_us() - t_restore_start) / 1e6;
 
-        // the entry tokens are an exact prefix of the request, restore them into the slot
+        // the state that was just loaded covers the whole entry, so the slot takes the entry token
+        // list as it is; the request is matched against it by the usual common-prefix logic
         llama_tokens tokens;
-        if (!disk_cache->tokens_of(cand.state_id, tokens) || tokens.size() != cand.n_tokens_match) {
+        if (!disk_cache->tokens_of(cand.state_id, tokens) || tokens.size() != cand.n_tokens_state) {
             metrics.disk_cache_corrupt_entries++;
             SRV_ERR("disk cache: entry %llu has no readable token list, removing it\n", (unsigned long long) cand.state_id);
 

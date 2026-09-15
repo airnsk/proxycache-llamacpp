@@ -244,12 +244,28 @@ static void test_candidate_search(const std::string & root) {
           "longest stored prefix wins (id %llu, %llu tokens)", (unsigned long long) cand.id, (unsigned long long) cand.n_tokens);
 
     CHECK(c.find(dc_tokens({7, 8, 9, 10, 11}), cand) && cand.id == id4 && cand.n_tokens == 4,
-          "a stored state longer than the request is not usable (id %llu, %llu tokens)", (unsigned long long) cand.id, (unsigned long long) cand.n_tokens);
+          "an entry longer than the request is not a candidate for find() (id %llu, %llu tokens)", (unsigned long long) cand.id, (unsigned long long) cand.n_tokens);
 
     CHECK(c.find(dc_tokens({7, 8, 9}), cand) && cand.id == id3 && cand.n_tokens == 3, "exact length match");
 
     CHECK(!c.find(dc_tokens({7, 8}), cand), "no entry of that length -> no candidate");
     CHECK(!c.find(dc_tokens({7, 8, 99}), cand), "a diverging token -> no candidate");
+
+    // Stage 7: find_best() matches by the longest common prefix, so an entry that is longer than
+    // the request is a candidate too - the surplus is trimmed by the slot after the restore
+    server_disk_cache_candidate cand_b;
+
+    CHECK(c.find_best(dc_tokens({7, 8, 9, 10, 11}), cand_b) && cand_b.id == id6 && cand_b.lcp == 5 && cand_b.n_tokens == 6,
+          "find_best: an entry longer than the request serves its common prefix (lcp %llu of %llu)",
+          (unsigned long long) cand_b.lcp, (unsigned long long) cand_b.n_tokens);
+
+    CHECK(c.find_best(dc_tokens({7, 8, 9, 10, 99}), cand_b) && cand_b.lcp == 4,
+          "find_best: a diverging token truncates the match (lcp %llu)", (unsigned long long) cand_b.lcp);
+
+    CHECK(c.find_best(dc_tokens({7, 8, 9, 10, 11, 12, 13}), cand_b) && cand_b.id == id6 && cand_b.lcp == 6,
+          "find_best: the longest entry wins when the request extends it");
+
+    CHECK(!c.find_best(dc_tokens({100, 200}), cand_b), "find_best: no shared prefix -> no candidate");
 
     // tampering with the stored tokens must make the entry unusable (this is the exact check that
     // protects against a hash collision)
@@ -376,6 +392,18 @@ static void test_lifecycle(const std::string & root) {
         many.push_back(id);
     }
     CHECK(c.n_entries() == 300, "300 entries stored (%zu)", c.n_entries());
+
+    // the LCP scan reads the token list of every entry, so its cost matters on every request -
+    // measure it against a realistic index size
+    {
+        const int n_iter = 100;
+        server_disk_cache_candidate c_tmp;
+        const int64_t t1 = ggml_time_us();
+        for (int i = 0; i < n_iter; ++i) {
+            c.find_best(dc_tokens({1000 + i}), c_tmp);
+        }
+        printf("   find_best over 300 entries: %.3f ms per call\n", (double) (ggml_time_us() - t1) / n_iter / 1000.0);
+    }
 
     const int64_t t0 = ggml_time_us();
     const size_t n_evicted = c.evict_lru(300);
