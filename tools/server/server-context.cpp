@@ -237,6 +237,110 @@ struct server_batch {
     }
 };
 
+//
+// Stage 4: conversion between the server's in-memory state and the disk-cache blobs
+//
+
+// one common_prompt_checkpoint is packed into a single self-describing blob, because the disk-cache
+// blob carries one byte array while a checkpoint has three (tgt / dft / spec)
+static std::vector<uint8_t> dc_ckpt_pack(const common_prompt_checkpoint & ckpt) {
+    const uint32_t magic   = 0x314b4344; // "DCK1"
+    const uint32_t version = 1;
+
+    std::vector<uint8_t> out;
+    out.reserve(48 + ckpt.size());
+
+    auto put = [&out](const void * src, size_t n) {
+        const uint8_t * p = (const uint8_t *) src;
+        out.insert(out.end(), p, p + n);
+    };
+
+    const int64_t n_tokens = ckpt.n_tokens;
+    const int32_t id_task  = ckpt.id_task;
+    const int32_t pos_min  = ckpt.pos_min;
+    const int32_t pos_max  = ckpt.pos_max;
+    const uint64_t n_tgt   = ckpt.data_tgt.size();
+    const uint64_t n_dft   = ckpt.data_dft.size();
+    const uint64_t n_spec  = ckpt.data_spec.size();
+
+    put(&magic,   sizeof(magic));
+    put(&version, sizeof(version));
+    put(&n_tokens, sizeof(n_tokens));
+    put(&id_task,  sizeof(id_task));
+    put(&pos_min,  sizeof(pos_min));
+    put(&pos_max,  sizeof(pos_max));
+    put(&n_tgt,    sizeof(n_tgt));
+    put(&n_dft,    sizeof(n_dft));
+    put(&n_spec,   sizeof(n_spec));
+
+    if (!ckpt.data_tgt.empty())  { put(ckpt.data_tgt.data(),  ckpt.data_tgt.size());  }
+    if (!ckpt.data_dft.empty())  { put(ckpt.data_dft.data(),  ckpt.data_dft.size());  }
+    if (!ckpt.data_spec.empty()) { put(ckpt.data_spec.data(), ckpt.data_spec.size()); }
+
+    return out;
+}
+
+static bool dc_ckpt_unpack(const std::vector<uint8_t> & blob, common_prompt_checkpoint & ckpt) {
+    const uint32_t magic_expected   = 0x314b4344;
+    const uint32_t version_expected = 1;
+
+    const size_t hdr = 4 + 4 + 8 + 4 + 4 + 4 + 8 + 8 + 8;
+    if (blob.size() < hdr) {
+        return false;
+    }
+
+    const uint8_t * p = blob.data();
+    size_t off = 0;
+
+    auto get = [&p, &off](void * dst, size_t n) {
+        memcpy(dst, p + off, n);
+        off += n;
+    };
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    int64_t  n_tokens = 0;
+    int32_t  id_task  = 0;
+    int32_t  pos_min  = 0;
+    int32_t  pos_max  = 0;
+    uint64_t n_tgt    = 0;
+    uint64_t n_dft    = 0;
+    uint64_t n_spec   = 0;
+
+    get(&magic,   sizeof(magic));
+    get(&version, sizeof(version));
+    get(&n_tokens, sizeof(n_tokens));
+    get(&id_task,  sizeof(id_task));
+    get(&pos_min,  sizeof(pos_min));
+    get(&pos_max,  sizeof(pos_max));
+    get(&n_tgt,    sizeof(n_tgt));
+    get(&n_dft,    sizeof(n_dft));
+    get(&n_spec,   sizeof(n_spec));
+
+    if (magic != magic_expected || version != version_expected) {
+        return false;
+    }
+    if (blob.size() != hdr + n_tgt + n_dft + n_spec) {
+        return false;
+    }
+
+    ckpt.clear();
+    ckpt.n_tokens = n_tokens;
+    ckpt.id_task  = id_task;
+    ckpt.pos_min  = pos_min;
+    ckpt.pos_max  = pos_max;
+
+    ckpt.data_tgt .resize(n_tgt);
+    ckpt.data_dft .resize(n_dft);
+    ckpt.data_spec.resize(n_spec);
+
+    if (n_tgt  > 0) { get(ckpt.data_tgt.data(),  n_tgt);  }
+    if (n_dft  > 0) { get(ckpt.data_dft.data(),  n_dft);  }
+    if (n_spec > 0) { get(ckpt.data_spec.data(), n_spec); }
+
+    return true;
+}
+
 struct server_slot {
     int id;
 
@@ -917,6 +1021,9 @@ private:
 
     std::unique_ptr<server_disk_cache> disk_cache;
 
+    // Stage 5: prefill-throughput estimate (EMA over the prompt evaluations this server has done)
+    server_disk_cache_cost disk_cost;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1421,13 +1528,21 @@ private:
             SRV_TRC("%s", "disk cache disabled - use `--cache-disk PATH` to enable it\n");
         }
 
+        // Stage 4 4.1 p.4: states that the RAM cache has to drop (size/token limit) are handed to the
+        // disk cache instead of being lost. Without a disk cache the callback stays unset and the
+        // RAM cache behaves exactly as before.
+        if (prompt_cache && disk_cache_enabled()) {
+            prompt_cache->on_evict = [this](const server_prompt_cache_state & state) {
+                disk_cache_save_evicted(state);
+            };
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
-
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
@@ -1603,6 +1718,299 @@ private:
         return nullptr;
     }
 
+    //
+    // Stage 4+5: persistent disk cache glue
+    //
+    // NOTE: all of it runs in the server main thread (llama_context is not thread-safe): the task
+    //       queue is drained from update_slots(), so get_available_slot() and the idle-slot loop
+    //       are on the same thread that calls llama_decode()
+    //
+
+    bool disk_cache_enabled() const {
+        return disk_cache != nullptr && disk_cache->ok();
+    }
+
+    // collects the sections that are not the target seq-state: draft context state, the slot's
+    // context checkpoints (tgt/dft/spec) and the speculative engine state
+    server_disk_cache_extra disk_cache_make_extra(const server_slot & slot) const {
+        server_disk_cache_extra extra;
+
+        if (slot.ctx_dft != nullptr) {
+            const size_t n = llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n > 0) {
+                server_disk_cache_blob blob;
+                blob.data.resize(n);
+                const size_t got = llama_state_seq_get_data_ext(slot.ctx_dft, blob.data.data(), n, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (got == n) {
+                    extra.dft.push_back(std::move(blob));
+                } else {
+                    SRV_WRN("disk cache: draft state size mismatch (%zu != %zu), the draft state is not saved\n", got, n);
+                }
+            }
+        }
+
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            server_disk_cache_blob blob;
+            blob.data   = dc_ckpt_pack(ckpt);
+            blob.n_tokens = (uint64_t) ckpt.n_tokens;
+            blob.pos_min  = (uint64_t) ckpt.pos_min;
+            blob.pos_max  = (uint64_t) ckpt.pos_max;
+            extra.ckpt.push_back(std::move(blob));
+        }
+
+        if (spec) {
+            std::vector<uint8_t> data;
+            if (common_speculative_get_state(spec.get(), slot.id, data) && !data.empty()) {
+                server_disk_cache_blob blob;
+                blob.data = std::move(data);
+                extra.spec.push_back(std::move(blob));
+            }
+        }
+
+        return extra;
+    }
+
+    // Stage 4 4.1 p.2/p.3: the two lifecycle points that write a slot state to the persistent cache
+    // (never per token). Runs in the main thread, the state is streamed straight from the context
+    // into the payload file.
+    bool disk_cache_save_slot(server_slot & slot, const char * tag) {
+        if (!disk_cache_enabled()) {
+            return false;
+        }
+        if (slot.ctx_tgt == nullptr || slot.prompt.tokens.empty()) {
+            return false;
+        }
+
+        const llama_tokens tokens = slot.prompt.tokens.get_tokens();
+
+        server_disk_cache_extra extra = disk_cache_make_extra(slot);
+
+        const size_t n_before = disk_cache->n_entries();
+        const int64_t t_start = ggml_time_us();
+
+        const uint64_t id = disk_cache->save(slot.ctx_tgt, slot.id, tokens, std::move(extra));
+
+        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+
+        if (id == 0) {
+            SRV_WRN("disk cache: failed to save the state of slot %d (%s)\n", slot.id, tag);
+            return false;
+        }
+
+        if (disk_cache->n_entries() > n_before) {
+            server_disk_cache_entry entry;
+            if (disk_cache->entry_info(id, entry)) {
+                metrics.disk_cache_writes++;
+                metrics.disk_cache_write_bytes += entry.payload_bytes;
+                SRV_INF("disk cache: saved state tokens=%zu id=%llu bytes=%llu in %.1f ms (%s)\n",
+                        tokens.size(), (unsigned long long) id, (unsigned long long) entry.payload_bytes, t_ms, tag);
+            } else {
+                metrics.disk_cache_writes++;
+                SRV_INF("disk cache: saved state tokens=%zu id=%llu in %.1f ms (%s)\n",
+                        tokens.size(), (unsigned long long) id, t_ms, tag);
+            }
+        } else {
+            SRV_TRC("disk cache: state with %zu tokens is already stored (id=%llu), %.1f ms (%s)\n",
+                    tokens.size(), (unsigned long long) id, t_ms, tag);
+        }
+
+        return true;
+    }
+
+    // Stage 4 4.1 p.4: a RAM-cache eviction is about to drop this state - write it to disk instead.
+    // The bytes are already in RAM, so no context access happens here (save_raw).
+    void disk_cache_save_evicted(const server_prompt_cache_state & state) {
+        if (!disk_cache_enabled()) {
+            return;
+        }
+        if (state.prompt.tokens.empty() || state.data.main.empty()) {
+            return;
+        }
+
+        server_disk_cache_extra extra;
+
+        if (!state.data.drft.empty()) {
+            server_disk_cache_blob blob;
+            blob.data = state.data.drft;
+            extra.dft.push_back(std::move(blob));
+        }
+
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            server_disk_cache_blob blob;
+            blob.data     = dc_ckpt_pack(ckpt);
+            blob.n_tokens = (uint64_t) ckpt.n_tokens;
+            blob.pos_min  = (uint64_t) ckpt.pos_min;
+            blob.pos_max  = (uint64_t) ckpt.pos_max;
+            extra.ckpt.push_back(std::move(blob));
+        }
+
+        const size_t n_before = disk_cache->n_entries();
+        const int64_t t_start = ggml_time_us();
+
+        const uint64_t id = disk_cache->save_raw(state.prompt.tokens.get_tokens(), state.data.main, std::move(extra));
+
+        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+
+        if (id == 0) {
+            SRV_WRN("disk cache: failed to save the evicted RAM-cache state (%zu tokens)\n", state.prompt.tokens.size());
+            return;
+        }
+
+        if (disk_cache->n_entries() > n_before) {
+            metrics.disk_cache_writes++;
+            server_disk_cache_entry entry;
+            if (disk_cache->entry_info(id, entry)) {
+                metrics.disk_cache_write_bytes += entry.payload_bytes;
+            }
+            SRV_INF("disk cache: saved evicted RAM-cache state tokens=%zu id=%llu in %.1f ms\n",
+                    state.prompt.tokens.size(), (unsigned long long) id, t_ms);
+        } else {
+            SRV_TRC("disk cache: evicted RAM-cache state (%zu tokens) is already stored (id=%llu)\n",
+                    state.prompt.tokens.size(), (unsigned long long) id);
+        }
+    }
+
+    // Stage 4 4.2/4.3: compare the state the slot holds right now (resident, possibly just taken
+    // from the RAM cache) with the best disk candidate and take the disk one if the cost model says
+    // it is better. No parallel inference path: afterwards the normal prompt handling continues.
+    void disk_cache_try_restore(server_slot & slot, const server_task & task) {
+        if (!disk_cache_enabled()) {
+            return;
+        }
+
+        const size_t n_prompt = task.tokens.size();
+        if (n_prompt == 0) {
+            return;
+        }
+
+        // media placeholders are not part of a disk entry (Stage 6)
+        if (task.tokens.has_mtmd) {
+            SRV_TRC("%s", "disk cache: multimodal request, the disk candidate is skipped\n");
+            return;
+        }
+
+        const server_disk_cache_config & cfg = disk_cache->config();
+
+        const double tps      = disk_cost.tps(cfg.prefill_tps);
+        const bool   tps_known = tps > 0.0;
+        const double read_bps = (double) cfg.read_mbps * 1e6; // the CLI value is decimal MB/s
+
+        // resident baseline: what the slot has right now
+        server_prefix_candidate cand_res;
+        cand_res.source         = SERVER_PREFIX_SOURCE_RESIDENT;
+        cand_res.n_tokens_state = slot.prompt.tokens.size();
+        cand_res.n_tokens_match = slot.prompt.tokens.get_common_prefix(task.tokens);
+        server_prefix_candidate_estimate(cand_res, n_prompt, tps, read_bps);
+
+        server_disk_cache_candidate cand_disk;
+        if (!disk_cache->find(task.tokens.get_tokens(), cand_disk)) {
+            metrics.disk_cache_misses++;
+            return;
+        }
+
+        metrics.disk_cache_hits++;
+
+        server_prefix_candidate cand;
+        cand.source         = SERVER_PREFIX_SOURCE_DISK;
+        cand.state_id       = cand_disk.id;
+        cand.n_tokens_state = cand_disk.n_tokens;
+        cand.n_tokens_match = cand_disk.n_tokens; // find() guarantees an exact prefix
+        cand.restore_bytes  = cand_disk.payload_bytes;
+        server_prefix_candidate_estimate(cand, n_prompt, tps, read_bps);
+
+        const std::string tps_str = tps_known ? std::to_string((int) tps) : std::string("unknown");
+
+        SRV_TRC("disk cache: candidate id=%llu, %zu tokens, %.2f MiB; resident %zu tokens (lcp %zu) of %zu; tps=%s\n",
+                (unsigned long long) cand.state_id, cand.n_tokens_match,
+                (double) cand.restore_bytes / (1024.0 * 1024.0),
+                cand_res.n_tokens_state, cand_res.n_tokens_match, n_prompt, tps_str.c_str());
+
+        std::string reason;
+
+        if (!server_prefix_candidate_prefer_disk(cand, cand_res, n_prompt, tps_known, cfg.min_gain_ms, &reason)) {
+            metrics.disk_cache_resident_preferred++;
+            SRV_TRC("disk cache: resident state preferred (disk: %zu tokens, %.2f MiB; resident: %zu tokens): %s\n",
+                    cand.n_tokens_match, (double) cand.restore_bytes / (1024.0 * 1024.0),
+                    cand_res.n_tokens_match, reason.c_str());
+            return;
+        }
+
+        SRV_INF("disk cache: disk state preferred (disk: %zu tokens, %.2f MiB; resident: %zu tokens): %s\n",
+                cand.n_tokens_match, (double) cand.restore_bytes / (1024.0 * 1024.0),
+                cand_res.n_tokens_match, reason.c_str());
+
+        const int64_t t_restore_start = ggml_time_us();
+
+        server_disk_cache_extra extra;
+        if (!disk_cache->load(slot.ctx_tgt, slot.id, cand.state_id, &extra)) {
+            metrics.disk_cache_corrupt_entries++;
+            SRV_ERR("disk cache: failed to restore entry %llu (%zu tokens), removing it\n",
+                    (unsigned long long) cand.state_id, cand.n_tokens_match);
+
+            // the target state may have been partially overwritten, so the slot state cannot be
+            // trusted any more; drop it and let the request do a full prefill
+            slot.prompt_clear();
+
+            disk_cache->remove_entry(cand.state_id);
+            return;
+        }
+
+        const double t_restore_s = (ggml_time_us() - t_restore_start) / 1e6;
+
+        // the entry tokens are an exact prefix of the request, restore them into the slot
+        llama_tokens tokens;
+        if (!disk_cache->tokens_of(cand.state_id, tokens) || tokens.size() != cand.n_tokens_match) {
+            metrics.disk_cache_corrupt_entries++;
+            SRV_ERR("disk cache: entry %llu has no readable token list, removing it\n", (unsigned long long) cand.state_id);
+
+            slot.prompt_clear();
+            disk_cache->remove_entry(cand.state_id);
+            return;
+        }
+
+        slot.prompt.checkpoints.clear();
+        for (auto & blob : extra.ckpt) {
+            common_prompt_checkpoint ckpt;
+            if (!dc_ckpt_unpack(blob.data, ckpt)) {
+                SRV_WRN("disk cache: cannot unpack a checkpoint of entry %llu, it is dropped\n", (unsigned long long) cand.state_id);
+                continue;
+            }
+            slot.prompt.checkpoints.push_back(std::move(ckpt));
+        }
+
+        // the draft state goes into ctx_dft exactly like the RAM-cache path does it
+        if (!extra.dft.empty()) {
+            if (slot.ctx_dft == nullptr) {
+                SRV_WRN("%s", "disk cache: entry has a draft state but the slot has no draft context\n");
+            } else {
+                const auto & blob = extra.dft[0];
+                const size_t n = llama_state_seq_set_data_ext(slot.ctx_dft, blob.data.data(), blob.data.size(), slot.id, 0);
+                if (n != blob.data.size()) {
+                    SRV_WRN("disk cache: failed to restore the draft state of entry %llu (%zu of %zu bytes)\n",
+                            (unsigned long long) cand.state_id, n, blob.data.size());
+                }
+            }
+        }
+
+        if (!extra.spec.empty() && spec) {
+            common_speculative_set_state(spec.get(), slot.id, extra.spec[0].data);
+        }
+
+        slot.prompt.tokens = server_tokens(tokens, false);
+
+        disk_cache->touch(cand.state_id);
+
+        metrics.disk_cache_restores++;
+        metrics.disk_cache_restore_bytes    += cand.restore_bytes;
+        metrics.disk_cache_restore_seconds  += t_restore_s;
+        metrics.disk_cache_disk_preferred++;
+        metrics.disk_cache_saved_prefill_tokens += cand.n_tokens_match;
+
+        SRV_INF("disk cache: restored %zu tokens in %.3fs (%.2f MiB, %.1f MB/s)\n",
+                cand.n_tokens_match, t_restore_s, (double) cand.restore_bytes / (1024.0 * 1024.0),
+                t_restore_s > 0.0 ? (double) cand.restore_bytes / t_restore_s / 1e6 : 0.0);
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1705,6 +2113,10 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                // Stage 4 4.1 p.2: the state that is about to leave the slot goes to the persistent
+                // cache as well (the slot still holds it at this point - prompt_load() comes next)
+                disk_cache_save_slot(*ret, "slot update");
+
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
@@ -1712,6 +2124,11 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            // Stage 4 4.2: resident (incl. the state just loaded from the RAM cache) vs disk
+            if (task.type == SERVER_TASK_TYPE_COMPLETION) {
+                disk_cache_try_restore(*ret, task);
             }
         }
 
@@ -2502,6 +2919,10 @@ private:
                                     prompt_cache->update();
                                 }
 
+                                // Stage 4 4.1 p.3: the idle state is saved to the persistent cache
+                                // before anything clears it
+                                disk_cache_save_slot(slot, "idle slot");
+
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
@@ -2572,6 +2993,10 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+
+                    // Stage 5: gauge, sampled when the metrics are scraped
+                    metrics.disk_cache_index_entries = disk_cache_enabled() ? disk_cache->n_entries() : 0;
+
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -3894,6 +4319,11 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // Stage 5: refresh the prefill-throughput estimate from this real measurement
+                if (slot.stats.is_set() && slot.stats.n_prompt_processed > 0 && slot.stats.t_prompt_ms() > 0.0) {
+                    disk_cost.observe(slot.stats.n_prompt_processed, slot.stats.t_prompt_ms() / 1e3);
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

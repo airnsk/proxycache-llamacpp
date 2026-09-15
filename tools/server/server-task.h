@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <functional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -622,6 +623,11 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // Stage 4 (PLAN-STAGE4-6.md 4.1 p.4): called right before a limit-driven eviction drops a state
+    // (the state is still intact when the callback runs). The disk cache uses it to keep the state
+    // instead of losing it. Unset = the cache behaves exactly as before.
+    std::function<void(const server_prompt_cache_state &)> on_evict;
 
     size_t size() const;
 

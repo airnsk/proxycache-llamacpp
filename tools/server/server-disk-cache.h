@@ -148,6 +148,66 @@ uint64_t server_disk_cache_hash_step(uint64_t h, llama_token token);
 uint64_t server_disk_cache_hash_prefix(const std::vector<llama_token> & tokens);
 
 //
+// Stage 4+5: the prefix candidate and the cost model
+//
+
+// where a candidate state comes from; the server compares exactly two of them:
+//   RESIDENT - what the slot holds right now (this includes a state just taken from the RAM cache)
+//   DISK     - an entry of this namespace that is an exact prefix of the request
+enum server_prefix_source {
+    SERVER_PREFIX_SOURCE_RESIDENT = 0,
+    SERVER_PREFIX_SOURCE_DISK     = 1,
+};
+
+struct server_prefix_candidate {
+    server_prefix_source source         = SERVER_PREFIX_SOURCE_RESIDENT;
+    uint64_t             state_id       = 0; // DISK only: entry id inside the namespace
+    size_t               n_tokens_state = 0; // tokens covered by the state
+    size_t               n_tokens_match = 0; // exact prefix match with the request (== n_tokens_state)
+    uint64_t             restore_bytes  = 0; // bytes that have to be read before the tail can be decoded
+
+    bool   t_estimate_valid = false; // false while the prefill throughput is not known
+    double t_restore_est    = 0.0;   // seconds
+    double t_tail_est       = 0.0;   // seconds
+    double t_total_est      = 0.0;   // seconds
+};
+
+// POLICY CONSTANTS - not measurements of any stand:
+// the disk path must win by this margin (hysteresis against estimation noise)
+#define SERVER_DISK_CACHE_COST_MARGIN 0.05
+// fixed per-restore overhead of the disk path. NOT MEASURED yet (Stage 7) - it stays 0 so that it
+// cannot hide a real cost; measure it before setting it to anything else
+#define SERVER_DISK_CACHE_T_RESTORE_FIXED_SEC 0.0
+// conservative prefill throughput used ONLY while nothing has been observed yet (policy floor)
+#define SERVER_DISK_CACHE_TPS_FLOOR 20.0
+// a prompt evaluation must cover at least this many tokens before its rate feeds the EMA: a prompt
+// that was almost fully restored decodes a token or two, and such a rate is pure noise
+#define SERVER_DISK_CACHE_TPS_MIN_TOKENS 32
+
+struct server_disk_cache_cost {
+    // EMA (alpha = 0.2) of the prefill throughput this server has actually observed; 0 = unknown
+    double   ema_tps = 0.0;
+    double   alpha   = 0.2;
+    uint64_t n_obs   = 0;
+
+    // one observation of a real prompt evaluation
+    void observe(size_t n_tokens, double t_seconds);
+
+    // effective prefill throughput: the CLI override wins over the EMA; 0 = unknown
+    double tps(int32_t cfg_prefill_tps) const;
+};
+
+// fills t_restore_est / t_tail_est / t_total_est; `tps` = 0 means "unknown"
+void server_prefix_candidate_estimate(server_prefix_candidate & cand, size_t n_prompt,
+                                      double tps, double read_bps);
+
+// the Stage 5 decision rule (PLAN-STAGE4-6.md 4.3); `reason` is always filled, for the log
+bool server_prefix_candidate_prefer_disk(const server_prefix_candidate & disk,
+                                         const server_prefix_candidate & resident,
+                                         size_t n_prompt, bool tps_known, int32_t min_gain_ms,
+                                         std::string * reason);
+
+//
 // the cache
 //
 
@@ -177,6 +237,9 @@ public:
 
     // exact token array of an entry, read from states/<id>.meta
     bool tokens_of(uint64_t id, std::vector<llama_token> & out) const;
+
+    // index record of an entry (no payload read); false when the entry is unknown
+    bool entry_info(uint64_t id, server_disk_cache_entry & out) const;
 
     // Stage 3: write the target sequence state straight into the payload file (streaming, no host
     // copy of the state); the extra sections are handed over as blobs and written one at a time

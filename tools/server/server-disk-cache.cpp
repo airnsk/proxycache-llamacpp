@@ -1329,6 +1329,21 @@ bool server_disk_cache::tokens_of(uint64_t id, std::vector<llama_token> & out) c
     return meta_read(id, entry, &out);
 }
 
+bool server_disk_cache::entry_info(uint64_t id, server_disk_cache_entry & out) const {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    for (const auto & e : entries) {
+        if (e.id == id) {
+            out = e;
+            return true;
+        }
+    }
+
+    // not in the index (e.g. the index was rebuilt while this entry was in flight): fall back to
+    // the meta file, still without reading any payload
+    return meta_read(id, out, nullptr);
+}
+
 bool server_disk_cache::find(const std::vector<llama_token> & tokens, server_disk_cache_candidate & out) const {
     std::lock_guard<std::mutex> lock(mtx);
 
@@ -1455,6 +1470,117 @@ size_t server_disk_cache::evict_lru(size_t n) {
         save_index();
     }
     return done;
+}
+
+//
+// Stage 4+5: the cost model
+//
+
+void server_disk_cache_cost::observe(size_t n_tokens, double t_seconds) {
+    if (n_tokens < SERVER_DISK_CACHE_TPS_MIN_TOKENS || t_seconds <= 0.0) {
+        return;
+    }
+
+    const double cur = (double) n_tokens / t_seconds;
+
+    // first observation initializes the EMA, later ones move it
+    ema_tps = ema_tps > 0.0 ? (alpha * cur + (1.0 - alpha) * ema_tps) : cur;
+    n_obs++;
+}
+
+double server_disk_cache_cost::tps(int32_t cfg_prefill_tps) const {
+    if (cfg_prefill_tps > 0) {
+        return (double) cfg_prefill_tps;
+    }
+
+    return ema_tps; // 0 = unknown
+}
+
+void server_prefix_candidate_estimate(server_prefix_candidate & cand, size_t n_prompt,
+                                      double tps, double read_bps) {
+    const size_t n_tail = n_prompt > cand.n_tokens_match ? n_prompt - cand.n_tokens_match : 0;
+
+    cand.t_restore_est = read_bps > 0.0 ? (double) cand.restore_bytes / read_bps : 0.0;
+    if (cand.restore_bytes > 0) {
+        cand.t_restore_est += SERVER_DISK_CACHE_T_RESTORE_FIXED_SEC;
+    }
+
+    cand.t_estimate_valid = tps > 0.0;
+    cand.t_tail_est       = cand.t_estimate_valid ? (double) n_tail / tps : 0.0;
+    cand.t_total_est      = cand.t_restore_est + cand.t_tail_est;
+}
+
+bool server_prefix_candidate_prefer_disk(const server_prefix_candidate & disk,
+                                         const server_prefix_candidate & resident,
+                                         size_t n_prompt, bool tps_known, int32_t min_gain_ms,
+                                         std::string * reason) {
+    auto fail = [reason](const std::string & why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+    auto pass = [reason](const std::string & why) {
+        if (reason) {
+            *reason = why;
+        }
+        return true;
+    };
+
+    if (disk.source != SERVER_PREFIX_SOURCE_DISK) {
+        return fail("not a disk candidate");
+    }
+
+    // the state must cover an exact prefix (the caller guarantees it via find()), but a candidate that
+    // does not beat the resident prefix cannot win: its tail is at least as long
+    if (disk.n_tokens_match <= resident.n_tokens_match) {
+        return fail(dc_format("disk prefix (%zu) is not longer than the resident one (%zu)",
+                              disk.n_tokens_match, resident.n_tokens_match));
+    }
+
+    if (disk.restore_bytes == 0) {
+        return fail("disk entry has no payload");
+    }
+
+    const double gain_ms_min = (double) min_gain_ms;
+
+    if (!tps_known) {
+        // no measurement yet (Stage 5, ТЗ §12): the resident path wins unless it is far from covering
+        // the request, and even then the win must hold at the conservative floor rate
+        if (resident.n_tokens_match * 100 >= n_prompt * 90) {
+            return fail(dc_format("prefill tps unknown and the resident state covers %zu/%zu tokens (>= 90%%)",
+                                  resident.n_tokens_match, n_prompt));
+        }
+
+        const double t_res = (double) (n_prompt - resident.n_tokens_match) / SERVER_DISK_CACHE_TPS_FLOOR;
+        const double t_dis = (double) (n_prompt - disk.n_tokens_match)     / SERVER_DISK_CACHE_TPS_FLOOR
+                           + disk.t_restore_est;
+        const double gain_ms = (t_res - t_dis) * 1e3;
+
+        if (gain_ms >= gain_ms_min) {
+            return pass(dc_format("prefill tps unknown, floor %.1f t/s: est. gain %.0f ms >= %d ms",
+                                  SERVER_DISK_CACHE_TPS_FLOOR, gain_ms, min_gain_ms));
+        }
+
+        return fail(dc_format("prefill tps unknown, floor %.1f t/s: est. gain %.0f ms < %d ms",
+                              SERVER_DISK_CACHE_TPS_FLOOR, gain_ms, min_gain_ms));
+    }
+
+    const double t_total_res = resident.t_total_est;
+    const double t_total_dis = disk.t_total_est * (1.0 + SERVER_DISK_CACHE_COST_MARGIN);
+    const double gain_ms     = (t_total_res - disk.t_total_est) * 1e3;
+
+    if (!(t_total_dis < t_total_res)) {
+        return fail(dc_format("t_total disk %.3f s (with %.0f%% margin) >= resident %.3f s",
+                              t_total_dis, 100.0 * SERVER_DISK_CACHE_COST_MARGIN, t_total_res));
+    }
+
+    if (!(gain_ms >= gain_ms_min)) {
+        return fail(dc_format("est. gain %.0f ms < %d ms", gain_ms, min_gain_ms));
+    }
+
+    return pass(dc_format("t_total disk %.3f s vs resident %.3f s (est. gain %.0f ms >= %d ms)",
+                          disk.t_total_est, t_total_res, gain_ms, min_gain_ms));
 }
 
 void server_disk_cache::enforce_limit() {
