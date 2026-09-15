@@ -1562,6 +1562,54 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "disk_cache_hits_total",
+            "Disk cache: requests with a usable state candidate",
+            (double) metrics.disk_cache_hits
+        }, {
+            "disk_cache_misses_total",
+            "Disk cache: requests without a state candidate",
+            (double) metrics.disk_cache_misses
+        }, {
+            "disk_cache_restores_total",
+            "Disk cache: states restored into a slot",
+            (double) metrics.disk_cache_restores
+        }, {
+            "disk_cache_restore_bytes_total",
+            "Disk cache: payload bytes read back from disk",
+            (double) metrics.disk_cache_restore_bytes
+        }, {
+            "disk_cache_restore_seconds_total",
+            "Disk cache: time spent restoring states from disk",
+            metrics.disk_cache_restore_seconds
+        }, {
+            "disk_cache_writes_total",
+            "Disk cache: states written to disk (an already-present state is not counted)",
+            (double) metrics.disk_cache_writes
+        }, {
+            "disk_cache_write_bytes_total",
+            "Disk cache: payload bytes written to disk",
+            (double) metrics.disk_cache_write_bytes
+        }, {
+            "disk_cache_evictions_total",
+            "Disk cache: entries dropped by the size limit",
+            (double) metrics.disk_cache_evictions
+        }, {
+            "disk_cache_corrupt_entries_total",
+            "Disk cache: entries that failed to restore and were removed",
+            (double) metrics.disk_cache_corrupt_entries
+        }, {
+            "disk_cache_resident_preferred_total",
+            "Disk cache: slot state kept after the cost model rejected the disk candidate",
+            (double) metrics.disk_cache_resident_preferred
+        }, {
+            "disk_cache_disk_preferred_total",
+            "Disk cache: disk state preferred over the resident one",
+            (double) metrics.disk_cache_disk_preferred
+        }, {
+            "disk_cache_saved_prefill_tokens_total",
+            "Disk cache: prompt tokens restored from disk, i.e. not recomputed",
+            (double) metrics.disk_cache_saved_prefill_tokens
         },
     };
 
@@ -1586,6 +1634,10 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "disk_cache_index_entries",
+            "Disk cache: states in the current namespace",
+            (double) metrics.disk_cache_index_entries
         },
     };
 
@@ -1753,6 +1805,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            // Stage 4: the state is still intact here - let the disk cache keep it
+            if (on_evict) {
+                on_evict(states.front());
+            }
+
             states.pop_front();
         }
     }
@@ -1872,6 +1929,11 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            // Stage 4: hand the state over to the disk cache before it is dropped
+            if (on_evict) {
+                on_evict(states.front());
+            }
+
             states.pop_front();
         }
     }
@@ -1886,6 +1948,11 @@ void server_prompt_cache::update() {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+
+            // Stage 4: hand the state over to the disk cache before it is dropped
+            if (on_evict) {
+                on_evict(states.front());
+            }
 
             states.pop_front();
         }

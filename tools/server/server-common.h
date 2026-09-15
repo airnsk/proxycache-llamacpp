@@ -481,6 +481,21 @@ struct server_metrics {
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // persistent disk cache (Stage 4/5), cumulative since the server started
+    uint64_t disk_cache_hits             = 0; // find() returned a usable candidate
+    uint64_t disk_cache_misses           = 0; // no candidate for this request
+    uint64_t disk_cache_restores         = 0; // successful restores of a disk state into a slot
+    uint64_t disk_cache_restore_bytes    = 0; // payload bytes read back from disk
+    double   disk_cache_restore_seconds  = 0.0;
+    uint64_t disk_cache_writes           = 0; // new entries written (a dedup hit of an existing state is not counted)
+    uint64_t disk_cache_write_bytes      = 0; // payload bytes of those entries
+    uint64_t disk_cache_evictions        = 0; // entries dropped by the size limit
+    uint64_t disk_cache_corrupt_entries  = 0; // entries that failed to restore and were removed
+    uint64_t disk_cache_resident_preferred = 0; // slot state kept, disk candidate rejected by the cost model
+    uint64_t disk_cache_disk_preferred     = 0; // disk state taken instead of the resident one
+    uint64_t disk_cache_saved_prefill_tokens = 0; // tokens restored from disk, i.e. not recomputed
+    uint64_t disk_cache_index_entries        = 0; // gauge: entries in the namespace at scrape time
+
     void init() {
         t_start = ggml_time_us();
     }
