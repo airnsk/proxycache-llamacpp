@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-disk-cache.cpp
+    server-disk-cache.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
@@ -32,6 +34,7 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE vendor::hash)
 
 # llama-server-impl: server logic, reusable by app
 
@@ -64,4 +67,13 @@ add_executable(${TARGET} main.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# self-test for the persistent disk cache (runs without a model)
+
+set(TARGET llama-disk-cache-selftest)
+
+add_executable(${TARGET} server-disk-cache-selftest.cpp)
+
+target_link_libraries(${TARGET} PRIVATE server-context vendor::hash)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

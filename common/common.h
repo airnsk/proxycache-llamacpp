@@ -630,6 +630,14 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    cache_ram_mib_set   = false; // true when -cram/--cache-ram was given explicitly
+
+    // persistent disk cache (tools/server/server-disk-cache.h)
+    std::string cache_disk;                     // --cache-disk: root of the persistent cache, empty = disabled
+    int64_t     cache_disk_size        = 500LL * 1024 * 1024 * 1024; // --cache-disk-size: limit of the WHOLE cache root, in bytes
+    int32_t     cache_disk_read_mbps   = 200;   // --cache-disk-read-mbps: assumed sequential read speed, decimal MB/s
+    int32_t     cache_disk_min_gain_ms = 1000;  // --cache-disk-min-gain-ms: minimum expected gain
+    int32_t     cache_prefill_tps      = 0;     // --cache-prefill-tps: prefill speed override, 0 = auto
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

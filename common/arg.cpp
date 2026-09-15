@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -342,6 +343,53 @@ static bool parse_bool_value(const std::string & value) {
 
 [[noreturn]] static void arg_removed(const std::string & msg) {
     throw std::invalid_argument("the argument has been removed. " + msg);
+}
+
+// parses a size in GiB with optional binary suffixes: a bare number is GiB, K/M/G/T switch the
+// unit to KiB/MiB/GiB/TiB ("500" = "500G" = 500 GiB, "1024M" = 1 GiB, "1T" = 1 TiB)
+static int64_t string_parse_size_gib(const std::string & value) {
+    if (value.empty()) {
+        throw std::invalid_argument("the size cannot be empty");
+    }
+
+    size_t pos = 0;
+    double number = 0.0;
+    try {
+        size_t used = 0;
+        number = std::stod(value, &used);
+        pos = used;
+    } catch (const std::exception &) {
+        throw std::invalid_argument(string_format("invalid size: '%s'", value.c_str()));
+    }
+
+    int64_t unit = 1024LL * 1024 * 1024; // a bare number is GiB
+    if (pos < value.size()) {
+        const char suffix = (char) std::toupper((unsigned char) value[pos]);
+        switch (suffix) {
+            case 'K': unit = 1024LL; break;
+            case 'M': unit = 1024LL * 1024; break;
+            case 'G': unit = 1024LL * 1024 * 1024; break;
+            case 'T': unit = 1024LL * 1024 * 1024 * 1024; break;
+            default: throw std::invalid_argument(string_format("invalid size suffix in '%s' (expected K, M, G or T)", value.c_str()));
+        }
+        pos++;
+        // tolerate the explicit byte form, e.g. 500GiB
+        if (pos < value.size() && (value[pos] == 'i' || value[pos] == 'I')) {
+            pos++;
+        }
+        if (pos < value.size() && (value[pos] == 'b' || value[pos] == 'B')) {
+            pos++;
+        }
+        if (pos != value.size()) {
+            throw std::invalid_argument(string_format("invalid size: '%s'", value.c_str()));
+        }
+    }
+
+    if (number < 0.0) {
+        throw std::invalid_argument(string_format("the size cannot be negative: '%s'", value.c_str()));
+    }
+
+    return (int64_t) (number * (double) unit);
 }
 
 //
@@ -1714,9 +1762,51 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
-            params.cache_ram_mib = value;
+            params.cache_ram_mib     = value;
+            params.cache_ram_mib_set = true;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "root directory of the persistent prefix/KV state cache (default: disabled - no disk cache)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-size"}, "N",
+        string_format("maximum total size of the persistent disk cache in GiB, covering the whole cache root "
+            "(all namespaces); binary suffixes K/M/G/T are accepted, a bare number is GiB "
+            "(default: %" PRId64 " = %" PRId64 " GiB, 0 - no limit)",
+            params.cache_disk_size, params.cache_disk_size / (1024LL * 1024 * 1024)),
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_size = string_parse_size_gib(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-read-mbps"}, "N",
+        string_format("assumed sequential read speed of the cache disk in decimal MB/s, 1 MB = 1000000 bytes; "
+            "used by the disk/ram cost model (default: %d)", params.cache_disk_read_mbps),
+        [](common_params & params, int value) {
+            params.cache_disk_read_mbps = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_READ_MBPS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-min-gain-ms"}, "N",
+        string_format("minimum expected gain in milliseconds to be worth reading a state from disk "
+            "(default: %d)", params.cache_disk_min_gain_ms),
+        [](common_params & params, int value) {
+            params.cache_disk_min_gain_ms = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_GAIN_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefill-tps"}, "N",
+        string_format("override the prompt processing (prefill) speed estimate in tokens/s used by the disk cache "
+            "cost model (default: %d, 0 = estimate from the observed timings)", params.cache_prefill_tps),
+        [](common_params & params, int value) {
+            params.cache_prefill_tps = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFILL_TPS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
