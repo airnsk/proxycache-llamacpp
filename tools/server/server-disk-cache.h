@@ -16,8 +16,7 @@
 // reads/sums and evicts its own files - other namespaces are left untouched.
 //
 // Stage 2: namespace + fingerprint + manifest + index + atomic writes.
-// Stage 3 (next commit): streamed save/load of the sequence state, so the target state never has to
-// be copied into a multi-GB host buffer.
+// Stage 3: streamed save/load of the sequence state (no multi-GB host buffer for the target state).
 // Stage 4-6 (slot selection, cost model, eviction/concurrency policy) plug in on top of this API.
 
 #include "llama.h"
@@ -182,12 +181,19 @@ public:
     // Stage 3: write the target sequence state straight into the payload file (streaming, no host
     // copy of the state); the extra sections are handed over as blobs and written one at a time
     // (peak RAM = one section). Returns the new entry id, or 0 on failure.
-    //
+    uint64_t save(llama_context * ctx_tgt, llama_seq_id seq_id,
+                  const std::vector<llama_token> & tokens,
+                  server_disk_cache_extra && extra);
+
     // same, but with a caller-provided payload for the target section (used by the self-test,
     // which runs without a model)
     uint64_t save_raw(const std::vector<llama_token> & tokens,
                       const std::vector<uint8_t> & main_payload,
                       server_disk_cache_extra && extra);
+
+    // restore the target sequence state from the payload file (llama_state_seq_load_file) and
+    // return the extra sections, if the caller asks for them
+    bool load(llama_context * ctx_tgt, llama_seq_id seq_id, uint64_t id, server_disk_cache_extra * extra_out);
 
     // full payload read-back, for tests and debugging (keeps the whole payload in RAM)
     bool read_payload(uint64_t id, std::vector<uint8_t> & main_out, server_disk_cache_extra * extra_out) const;
@@ -233,7 +239,8 @@ private:
     void drop_tmp_files() const;
 
     uint64_t save_impl(const std::vector<llama_token> & tokens,
-                       const std::vector<uint8_t> & main_payload,
+                       const std::vector<uint8_t> * main_payload, // null = stream from ctx
+                       llama_context * ctx_tgt, llama_seq_id seq_id,
                        server_disk_cache_extra && extra);
 
     void drop_orphan_payloads() const;
