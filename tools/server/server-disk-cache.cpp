@@ -683,6 +683,8 @@ bool server_disk_cache::open_namespace() {
     if (have_index) {
         LOG_INF("disk cache: loaded index: %zu states, %.1f MiB\n", entries.size(),
                 (double) n_bytes_ / (1024.0 * 1024.0));
+    } else if (fresh) {
+        save_index(); // a new namespace starts with an empty index
     } else {
         LOG_WRN("disk cache: no usable index.bin in '%s', rebuilding from states/*.meta\n", ns_dir.c_str());
         rebuild_index();
@@ -799,32 +801,31 @@ bool server_disk_cache::save_index() const {
     const std::string path = ns_dir + "/index.bin";
     const std::string tmp  = path + ".tmp";
 
-    std::vector<uint8_t> buf;
-    buf.resize(DC_INDEX_HEADER + DC_INDEX_ENTRY * entries.size());
-
-    {
-        uint8_t * h = buf.data();
-        memset(h, 0, DC_INDEX_HEADER);
-        memcpy(h, DC_INDEX_MAGIC, 8);
-        dc_put_u32(h +  8, 1);
-        dc_put_u32(h + 12, DC_INDEX_HEADER);
-        dc_put_u32(h + 16, DC_INDEX_ENTRY);
-        dc_put_u32(h + 20, (uint32_t) entries.size());
-        dc_put_u64(h + 24, next_id);
-        dc_put_u32(h + 56, 0);
-        dc_put_u32(h + 56, dc_crc32(h, DC_INDEX_HEADER));
-
-        for (size_t i = 0; i < entries.size(); ++i) {
-            dc_index_entry_encode(buf.data() + DC_INDEX_HEADER + i * DC_INDEX_ENTRY, entries[i]);
-        }
-    }
+    // the header lives in a stack buffer, the entries are streamed one by one
+    uint8_t header[DC_INDEX_HEADER];
+    memset(header, 0, sizeof(header));
+    memcpy(header, DC_INDEX_MAGIC, 8);
+    dc_put_u32(header +  8, 1);
+    dc_put_u32(header + 12, DC_INDEX_HEADER);
+    dc_put_u32(header + 16, DC_INDEX_ENTRY);
+    dc_put_u32(header + 20, (uint32_t) entries.size());
+    dc_put_u64(header + 24, next_id);
+    dc_put_u32(header + 56, 0);
+    dc_put_u32(header + 56, dc_crc32(header, DC_INDEX_HEADER));
 
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             return false;
         }
-        f.write((const char *) buf.data(), (std::streamsize) buf.size());
+        f.write((const char *) header, sizeof(header));
+
+        uint8_t buf[DC_INDEX_ENTRY];
+        for (const auto & e : entries) {
+            dc_index_entry_encode(buf, e);
+            f.write((const char *) buf, sizeof(buf));
+        }
+
         f.flush();
         if (!f) {
             return false;
@@ -906,20 +907,31 @@ bool server_disk_cache::meta_write(uint64_t id, const server_disk_cache_entry & 
     const std::string path = path_meta(id);
     const std::string tmp  = path_tmp(path);
 
-    std::vector<uint8_t> buf(DC_META_HEADER + sizeof(uint32_t) * tokens.size());
-    dc_meta_encode(buf.data(), DC_META_MAGIC, fpv.hex, entry, entry.main_bytes,
+    uint8_t header[DC_META_HEADER];
+    dc_meta_encode(header, DC_META_MAGIC, fpv.hex, entry, entry.main_bytes,
                    entry.main_bytes + entry.dft_bytes,
                    entry.main_bytes + entry.dft_bytes + entry.ckpt_bytes);
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        dc_put_u32(buf.data() + DC_META_HEADER + i * sizeof(uint32_t), (uint32_t) tokens[i]);
-    }
 
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             return false;
         }
-        f.write((const char *) buf.data(), (std::streamsize) buf.size());
+        f.write((const char *) header, sizeof(header));
+
+        // the exact token array is written in chunks, so a long prompt does not need a second copy
+        const size_t chunk_tokens = 4096;
+        std::vector<uint8_t> chunk(sizeof(uint32_t) * std::min(chunk_tokens, tokens.size()));
+        size_t pos = 0;
+        while (pos < tokens.size()) {
+            const size_t n = std::min(chunk_tokens, tokens.size() - pos);
+            for (size_t i = 0; i < n; ++i) {
+                dc_put_u32(chunk.data() + i * sizeof(uint32_t), (uint32_t) tokens[pos + i]);
+            }
+            f.write((const char *) chunk.data(), (std::streamsize) (n * sizeof(uint32_t)));
+            pos += n;
+        }
+
         f.flush();
         if (!f) {
             return false;
@@ -1039,7 +1051,8 @@ static bool dc_section_read(std::istream & f, uint64_t bytes, std::vector<server
 }
 
 uint64_t server_disk_cache::save_impl(const std::vector<llama_token> & tokens,
-                                      const std::vector<uint8_t> & main_payload,
+                                      const std::vector<uint8_t> * main_payload,
+                                      llama_context * ctx_tgt, llama_seq_id seq_id,
                                       server_disk_cache_extra && extra) {
     if (tokens.empty()) {
         LOG_WRN("%s", "disk cache: refusing to save an empty token sequence\n");
@@ -1079,14 +1092,14 @@ uint64_t server_disk_cache::save_impl(const std::vector<llama_token> & tokens,
     const std::string tmp  = path_tmp(path);
 
     uint64_t main_bytes = 0;
-    {
+    if (main_payload) {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             LOG_WRN("disk cache: cannot create '%s'\n", tmp.c_str());
             return 0;
         }
-        if (!main_payload.empty()) {
-            f.write((const char *) main_payload.data(), (std::streamsize) main_payload.size());
+        if (!main_payload->empty()) {
+            f.write((const char *) main_payload->data(), (std::streamsize) main_payload->size());
         }
         f.flush();
         if (!f) {
@@ -1095,7 +1108,16 @@ uint64_t server_disk_cache::save_impl(const std::vector<llama_token> & tokens,
             fs::remove(tmp, ec);
             return 0;
         }
-        main_bytes = main_payload.size();
+        main_bytes = main_payload->size();
+    } else {
+        // streamed straight into the payload file: no host copy of the target state
+        main_bytes = (uint64_t) llama_state_seq_save_file(ctx_tgt, tmp.c_str(), seq_id, tokens.data(), tokens.size());
+        if (main_bytes == 0) {
+            LOG_WRN("disk cache: failed to save the target state of entry %llu\n", (unsigned long long) id);
+            std::error_code ec;
+            fs::remove(tmp, ec);
+            return 0;
+        }
     }
 
     const uint64_t dft_bytes  = dc_section_bytes(extra.dft);
@@ -1176,7 +1198,6 @@ uint64_t server_disk_cache::save_impl(const std::vector<llama_token> & tokens,
 
     index_add(entry);
     root_bytes_ += entry.payload_bytes;
-    next_id++;
 
     if (!save_index()) {
         LOG_WRN("%s", "disk cache: index update failed, the entry stays on disk and will be picked up by a rebuild\n");
@@ -1192,10 +1213,20 @@ uint64_t server_disk_cache::save_impl(const std::vector<llama_token> & tokens,
     return id;
 }
 
+uint64_t server_disk_cache::save(llama_context * ctx_tgt, llama_seq_id seq_id,
+                                 const std::vector<llama_token> & tokens,
+                                 server_disk_cache_extra && extra) {
+    if (ctx_tgt == nullptr) {
+        LOG_WRN("%s", "disk cache: no target context\n");
+        return 0;
+    }
+    return save_impl(tokens, nullptr, ctx_tgt, seq_id, std::move(extra));
+}
+
 uint64_t server_disk_cache::save_raw(const std::vector<llama_token> & tokens,
                                      const std::vector<uint8_t> & main_payload,
                                      server_disk_cache_extra && extra) {
-    return save_impl(tokens, main_payload, std::move(extra));
+    return save_impl(tokens, &main_payload, nullptr, 0, std::move(extra));
 }
 
 bool server_disk_cache::payload_read(uint64_t id, const server_disk_cache_entry & entry,
@@ -1250,6 +1281,46 @@ bool server_disk_cache::read_payload(uint64_t id, std::vector<uint8_t> & main_ou
         return false;
     }
     return payload_read(id, entry, &main_out, extra_out);
+}
+
+bool server_disk_cache::load(llama_context * ctx_tgt, llama_seq_id seq_id, uint64_t id, server_disk_cache_extra * extra_out) {
+    if (ctx_tgt == nullptr) {
+        LOG_WRN("%s", "disk cache: no target context\n");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!ready) {
+        return false;
+    }
+
+    server_disk_cache_entry entry;
+    if (!meta_read(id, entry, nullptr)) {
+        LOG_WRN("disk cache: no usable meta for entry %llu\n", (unsigned long long) id);
+        return false;
+    }
+    if (dc_file_size(path_bin(id)) != entry.payload_bytes) {
+        LOG_WRN("disk cache: payload of entry %llu is missing or has the wrong size\n", (unsigned long long) id);
+        return false;
+    }
+
+    std::vector<llama_token> tokens(entry.n_tokens);
+    size_t n_tokens_out = 0;
+    const size_t res = llama_state_seq_load_file(ctx_tgt, path_bin(id).c_str(), seq_id,
+                                                 tokens.data(), tokens.size(), &n_tokens_out);
+    if (res == 0 || n_tokens_out != entry.n_tokens) {
+        LOG_WRN("disk cache: failed to restore entry %llu (%zu tokens read)\n", (unsigned long long) id, n_tokens_out);
+        return false;
+    }
+    tokens.clear();
+    tokens.shrink_to_fit();
+
+    if (extra_out && !payload_read(id, entry, nullptr, extra_out)) {
+        LOG_WRN("disk cache: failed to read the extra sections of entry %llu\n", (unsigned long long) id);
+        return false;
+    }
+
+    return true;
 }
 
 bool server_disk_cache::tokens_of(uint64_t id, std::vector<llama_token> & out) const {
