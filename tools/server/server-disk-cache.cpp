@@ -1327,6 +1327,139 @@ struct dc_read_guard {
 };
 }
 
+// Stage 8: background read of an entry.
+//
+// The file holds what llama_state_seq_save_file() wrote:
+//
+//   [u32 magic][u32 version][u32 n_tokens][tokens...][state payload]
+//
+// while llama_state_seq_set_data_ext() takes the buffer form
+//
+//   [u32 io_magic][llama_seq_id][state payload]
+//
+// so the worker copies the payload and puts the two-word prefix in front of it. Either the layout
+// is right and the state applies, or the apply fails and the entry is dropped - the restore is
+// verified end to end by the bit-exact tests, not by reading the header here.
+static constexpr uint32_t dc_io_magic = 0xaf143cd8; // mirrors io_magic in src/llama-context.cpp
+
+server_disk_cache_load_job::~server_disk_cache_load_job() {
+    // the worker captures a raw pointer to this object, so it must be finished before the object
+    // dies - joining here is what keeps that safe (and it returns at once once the read is done)
+    if (worker.joinable()) {
+        worker.join();
+    }
+    if (release_inflight) {
+        release_inflight();
+    }
+}
+
+std::shared_ptr<server_disk_cache_load_job> server_disk_cache::load_begin(uint64_t id) {
+    server_disk_cache_entry entry;
+
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!ready) {
+            return nullptr;
+        }
+        if (!meta_read(id, entry, nullptr)) {
+            LOG_WRN("disk cache: no usable meta for entry %llu\n", (unsigned long long) id);
+            return nullptr;
+        }
+        if (dc_file_size(path_bin(id)) != entry.payload_bytes) {
+            LOG_WRN("disk cache: payload of entry %llu is missing or has the wrong size\n", (unsigned long long) id);
+            return nullptr;
+        }
+
+        // keep the entry from being evicted while the job reads it
+        begin_read(id);
+    }
+
+    auto job = std::make_shared<server_disk_cache_load_job>();
+    job->id               = id;
+    job->n_tokens         = entry.n_tokens;
+    job->restore_bytes    = entry.payload_bytes;
+    job->t_start_us       = ggml_time_us();
+    job->release_inflight = [this, id]() {
+        std::lock_guard<std::mutex> lock(mtx);
+        end_read(id);
+    };
+
+    const std::string bin       = path_bin(id);
+    const uint64_t    main_bytes = entry.main_bytes;
+    const uint64_t    n_tokens   = entry.n_tokens;
+    const server_disk_cache_entry entry_copy = entry;
+    server_disk_cache_load_job * const job_ptr = job.get();
+
+    job->worker = std::thread([this, job_ptr, bin, main_bytes, n_tokens, entry_copy]() {
+        server_disk_cache_load_job & j = *job_ptr;
+
+        const uint64_t header = (uint64_t) sizeof(uint32_t) * 3 + (uint64_t) sizeof(llama_token) * n_tokens;
+        if (main_bytes < header) {
+            j.failed = true;
+            j.done   = true;
+            return;
+        }
+
+        std::ifstream f(bin, std::ios::binary);
+        if (!f) {
+            j.failed = true;
+            j.done   = true;
+            return;
+        }
+
+        uint32_t magic = 0, version = 0, n_tokens_u32 = 0;
+        f.read((char *) &magic,         sizeof(magic));
+        f.read((char *) &version,       sizeof(version));
+        f.read((char *) &n_tokens_u32,  sizeof(n_tokens_u32));
+        if (!f || n_tokens_u32 != (uint32_t) n_tokens) {
+            j.failed = true;
+            j.done   = true;
+            return;
+        }
+
+        j.tokens.assign(n_tokens, 0);
+        if (n_tokens > 0) {
+            f.read((char *) j.tokens.data(), (std::streamsize) (sizeof(llama_token) * n_tokens));
+            if (!f) {
+                j.failed = true;
+                j.done   = true;
+                return;
+            }
+        }
+
+        const uint64_t state_bytes = main_bytes - header;
+        j.state.resize(sizeof(uint32_t) + sizeof(llama_seq_id) + state_bytes);
+
+        const uint32_t     io_magic = dc_io_magic;
+        const llama_seq_id seq_id   = 0;
+        memcpy(j.state.data(), &io_magic, sizeof(io_magic));
+        memcpy(j.state.data() + sizeof(io_magic), &seq_id, sizeof(seq_id));
+
+        if (state_bytes > 0) {
+            f.read((char *) j.state.data() + sizeof(io_magic) + sizeof(seq_id), (std::streamsize) state_bytes);
+            if (!f) {
+                j.failed = true;
+                j.done   = true;
+                return;
+            }
+        }
+        f.close();
+
+        // the dft / ckpt / spec sections follow the main payload in the same file
+        if (entry_copy.payload_bytes > main_bytes) {
+            if (!payload_read(entry_copy.id, entry_copy, nullptr, &j.extra)) {
+                j.failed = true;
+                j.done   = true;
+                return;
+            }
+        }
+
+        j.done = true;
+    });
+
+    return job;
+}
+
 bool server_disk_cache::load(llama_context * ctx_tgt, llama_seq_id seq_id, uint64_t id, server_disk_cache_extra * extra_out) {
     if (ctx_tgt == nullptr) {
         LOG_WRN("%s", "disk cache: no target context\n");

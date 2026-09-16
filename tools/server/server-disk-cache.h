@@ -23,6 +23,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <atomic>
+#include <functional>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -213,6 +216,36 @@ bool server_prefix_candidate_prefer_disk(const server_prefix_candidate & disk,
 // the cache
 //
 
+// Stage 8: a load that runs on a worker thread. The payload is read into the host buffer the
+// sequence-state API accepts, and the caller applies it later, on the thread that owns the context:
+//
+//   llama_state_seq_set_data_ext(ctx, job->state.data(), job->state.size(), seq_id, 0)
+//
+// so a multi-GB read no longer blocks the server loop for its whole duration.
+struct server_disk_cache_load_job {
+    uint64_t id              = 0;
+    uint64_t n_tokens        = 0; // tokens the entry holds
+    uint64_t n_tokens_match  = 0; // how much of the request the entry serves (set by the caller)
+    uint64_t restore_bytes   = 0;
+    int64_t  t_start_us      = 0;
+
+    std::vector<llama_token> tokens;
+    std::vector<uint8_t>     state; // [u32 io_magic][llama_seq_id][state payload]
+    server_disk_cache_extra  extra;
+
+    std::atomic<bool> done   { false };
+    std::atomic<bool> failed { false };
+
+    std::thread           worker;
+    std::function<void()> release_inflight;
+
+    server_disk_cache_load_job() = default;
+    ~server_disk_cache_load_job();
+
+    server_disk_cache_load_job(const server_disk_cache_load_job &)            = delete;
+    server_disk_cache_load_job & operator=(const server_disk_cache_load_job &) = delete;
+};
+
 class server_disk_cache {
 public:
     server_disk_cache(const server_disk_cache_config & cfg, const server_disk_cache_fingerprint & fp);
@@ -268,6 +301,10 @@ public:
     // restore the target sequence state from the payload file (llama_state_seq_load_file) and
     // return the extra sections, if the caller asks for them
     bool load(llama_context * ctx_tgt, llama_seq_id seq_id, uint64_t id, server_disk_cache_extra * extra_out);
+
+    // Stage 8: start reading an entry on a worker thread. The returned job is ready when
+    // job->done is set; apply it with llama_state_seq_set_data_ext() on the context's own thread.
+    std::shared_ptr<server_disk_cache_load_job> load_begin(uint64_t id);
 
     // Lifecycle guard (stage 6): an entry that is being read is never unlinked by eviction.
     // The internal lock is expected to be held (every read path holds it); the pair is public so
