@@ -1800,6 +1800,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIN_GAIN_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-min-tokens"}, "N",
+        string_format("do not store prompts shorter than this on disk - a state costs disk space and a write "
+            "regardless of its length, so short prompts would never pay for themselves "
+            "(default: %d, 0 = store everything)", params.cache_disk_min_tokens),
+        [](common_params & params, int value) {
+            params.cache_disk_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-prefill-tps"}, "N",
         string_format("override the prompt processing (prefill) speed estimate in tokens/s used by the disk cache "
             "cost model (default: %d, 0 = estimate from the observed timings)", params.cache_prefill_tps),

@@ -244,12 +244,28 @@ static void test_candidate_search(const std::string & root) {
           "longest stored prefix wins (id %llu, %llu tokens)", (unsigned long long) cand.id, (unsigned long long) cand.n_tokens);
 
     CHECK(c.find(dc_tokens({7, 8, 9, 10, 11}), cand) && cand.id == id4 && cand.n_tokens == 4,
-          "a stored state longer than the request is not usable (id %llu, %llu tokens)", (unsigned long long) cand.id, (unsigned long long) cand.n_tokens);
+          "an entry longer than the request is not a candidate for find() (id %llu, %llu tokens)", (unsigned long long) cand.id, (unsigned long long) cand.n_tokens);
 
     CHECK(c.find(dc_tokens({7, 8, 9}), cand) && cand.id == id3 && cand.n_tokens == 3, "exact length match");
 
     CHECK(!c.find(dc_tokens({7, 8}), cand), "no entry of that length -> no candidate");
     CHECK(!c.find(dc_tokens({7, 8, 99}), cand), "a diverging token -> no candidate");
+
+    // Stage 7: find_best() matches by the longest common prefix, so an entry that is longer than
+    // the request is a candidate too - the surplus is trimmed by the slot after the restore
+    server_disk_cache_candidate cand_b;
+
+    CHECK(c.find_best(dc_tokens({7, 8, 9, 10, 11}), cand_b) && cand_b.id == id6 && cand_b.lcp == 5 && cand_b.n_tokens == 6,
+          "find_best: an entry longer than the request serves its common prefix (lcp %llu of %llu)",
+          (unsigned long long) cand_b.lcp, (unsigned long long) cand_b.n_tokens);
+
+    CHECK(c.find_best(dc_tokens({7, 8, 9, 10, 99}), cand_b) && cand_b.lcp == 4,
+          "find_best: a diverging token truncates the match (lcp %llu)", (unsigned long long) cand_b.lcp);
+
+    CHECK(c.find_best(dc_tokens({7, 8, 9, 10, 11, 12, 13}), cand_b) && cand_b.id == id6 && cand_b.lcp == 6,
+          "find_best: the longest entry wins when the request extends it");
+
+    CHECK(!c.find_best(dc_tokens({100, 200}), cand_b), "find_best: no shared prefix -> no candidate");
 
     // tampering with the stored tokens must make the entry unusable (this is the exact check that
     // protects against a hash collision)
@@ -324,6 +340,78 @@ static void test_crash_recovery(const std::string & root) {
     }
 }
 
+static void test_lifecycle(const std::string & root) {
+    printf("[lifecycle guard / bulk eviction]\n");
+
+    const auto fp = server_disk_cache_fp_make(dc_fp_params());
+    server_disk_cache_config cfg;
+    cfg.root = root;
+
+    server_disk_cache c(cfg, fp);
+    CHECK(c.ok(), "cache opened");
+
+    std::vector<uint64_t> ids;
+    for (int i = 1; i <= 5; i++) {
+        const uint64_t id = c.save_raw(dc_tokens({100 + i}), dc_bytes(1000, (uint8_t) i), server_disk_cache_extra());
+        CHECK(id != 0, "entry %d stored", i);
+        c.set_last_used(id, 1000 + i);
+        ids.push_back(id);
+    }
+    CHECK(c.n_entries() == 5, "five entries before eviction (%zu)", c.n_entries());
+
+    // the entry in the middle of the LRU order is pinned by a reader
+    const uint64_t pinned = ids[2];
+    c.begin_read(pinned);
+    CHECK(c.n_inflight() == 1, "one entry is marked as in use (%zu)", c.n_inflight());
+
+    const size_t evicted = c.evict_lru(10);
+    CHECK(evicted == 4, "eviction removed the four unpinned entries (%zu)", evicted);
+    CHECK(c.n_entries() == 1, "the pinned entry survived (%zu entries left)", c.n_entries());
+    CHECK(fs::exists(c.dir() + "/states/" + std::to_string(pinned) + ".bin"), "the payload of the pinned entry is still on disk");
+    CHECK(!fs::exists(c.dir() + "/states/" + std::to_string(ids[0]) + ".bin"), "the oldest entry is gone");
+    CHECK(c.n_bytes() == 1000 + 3 * DC_EMPTY_SECTION, "byte counter is exact after the eviction (%llu)", (unsigned long long) c.n_bytes());
+
+    // once the reader is done the entry is evictable, and the index on disk agrees
+    c.end_read(pinned);
+    CHECK(c.n_inflight() == 0, "no entry is in use anymore");
+    CHECK(c.evict_lru(10) == 1, "the released entry is evicted");
+    CHECK(c.n_entries() == 0 && c.n_bytes() == 0, "cache is empty and the counters are zero (%zu, %llu)",
+          c.n_entries(), (unsigned long long) c.n_bytes());
+
+    {
+        server_disk_cache c2(cfg, fp);
+        CHECK(c2.ok() && c2.n_entries() == 0, "reopened index agrees on the eviction (%zu entries)", c2.n_entries());
+    }
+
+    // bulk eviction cost: with the old O(n^2) picker this loop took quadratic time
+    std::vector<uint64_t> many;
+    many.reserve(300);
+    for (int i = 0; i < 300; i++) {
+        const uint64_t id = c.save_raw(dc_tokens({1000 + i}), dc_bytes(512, (uint8_t) (i & 0xff)), server_disk_cache_extra());
+        c.set_last_used(id, 5000 + i);
+        many.push_back(id);
+    }
+    CHECK(c.n_entries() == 300, "300 entries stored (%zu)", c.n_entries());
+
+    // the LCP scan reads the token list of every entry, so its cost matters on every request -
+    // measure it against a realistic index size
+    {
+        const int n_iter = 100;
+        server_disk_cache_candidate c_tmp;
+        const int64_t t1 = ggml_time_us();
+        for (int i = 0; i < n_iter; ++i) {
+            c.find_best(dc_tokens({1000 + i}), c_tmp);
+        }
+        printf("   find_best over 300 entries: %.3f ms per call\n", (double) (ggml_time_us() - t1) / n_iter / 1000.0);
+    }
+
+    const int64_t t0 = ggml_time_us();
+    const size_t n_evicted = c.evict_lru(300);
+    const double ms = (ggml_time_us() - t0) / 1000.0;
+    CHECK(n_evicted == 300 && c.n_entries() == 0, "all 300 entries evicted (%zu, %zu left)", n_evicted, c.n_entries());
+    printf("   bulk eviction of 300 entries: %.1f ms\n", ms);
+}
+
 static void test_eviction(const std::string & root) {
     printf("[eviction / size limit]\n");
 
@@ -380,6 +468,7 @@ int main(int argc, char ** argv) {
     const std::string root_cand = root + "/cand";
     const std::string root_crash = root + "/crash";
     const std::string root_evict = root + "/evict";
+    const std::string root_life  = root + "/life";
 
     test_fingerprint();
     test_namespace_and_manifest(root_ns);
@@ -387,6 +476,7 @@ int main(int argc, char ** argv) {
     test_candidate_search(root_cand);
     test_crash_recovery(root_crash);
     test_eviction(root_evict);
+    test_lifecycle(root_life);
 
     printf("\n");
     if (n_fail == 0) {

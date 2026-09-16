@@ -23,6 +23,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <atomic>
+#include <functional>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -102,6 +105,7 @@ struct server_disk_cache_config {
     uint64_t    size_limit_bytes = 500ull * 1024 * 1024 * 1024;  // --cache-disk-size (whole root)
     int32_t     read_mbps        = 200;                          // --cache-disk-read-mbps (decimal MB/s)
     int32_t     min_gain_ms      = 1000;                         // --cache-disk-min-gain-ms
+    int32_t     min_tokens       = 1024;                         // --cache-disk-min-tokens: shorter prompts are never written
     int32_t     prefill_tps      = 0;                            // --cache-prefill-tps (0 = auto)
 };
 
@@ -141,6 +145,7 @@ struct server_disk_cache_entry {
 struct server_disk_cache_candidate {
     uint64_t id            = 0;
     uint64_t n_tokens      = 0;
+    uint64_t lcp           = 0; // how much of the request this entry can serve
     uint64_t payload_bytes = 0;
 };
 
@@ -211,6 +216,36 @@ bool server_prefix_candidate_prefer_disk(const server_prefix_candidate & disk,
 // the cache
 //
 
+// Stage 8: a load that runs on a worker thread. The payload is read into the host buffer the
+// sequence-state API accepts, and the caller applies it later, on the thread that owns the context:
+//
+//   llama_state_seq_set_data_ext(ctx, job->state.data(), job->state.size(), seq_id, 0)
+//
+// so a multi-GB read no longer blocks the server loop for its whole duration.
+struct server_disk_cache_load_job {
+    uint64_t id              = 0;
+    uint64_t n_tokens        = 0; // tokens the entry holds
+    uint64_t n_tokens_match  = 0; // how much of the request the entry serves (set by the caller)
+    uint64_t restore_bytes   = 0;
+    int64_t  t_start_us      = 0;
+
+    std::vector<llama_token> tokens;
+    std::vector<uint8_t>     state; // [u32 io_magic][llama_seq_id][state payload]
+    server_disk_cache_extra  extra;
+
+    std::atomic<bool> done   { false };
+    std::atomic<bool> failed { false };
+
+    std::thread           worker;
+    std::function<void()> release_inflight;
+
+    server_disk_cache_load_job() = default;
+    ~server_disk_cache_load_job();
+
+    server_disk_cache_load_job(const server_disk_cache_load_job &)            = delete;
+    server_disk_cache_load_job & operator=(const server_disk_cache_load_job &) = delete;
+};
+
 class server_disk_cache {
 public:
     server_disk_cache(const server_disk_cache_config & cfg, const server_disk_cache_fingerprint & fp);
@@ -230,10 +265,19 @@ public:
     uint64_t n_bytes()   const;  // sum of payload_bytes over the entries of this namespace
     uint64_t root_bytes() const; // size of the whole cache root as seen at open/top-up time
 
+    // cumulative counters of this namespace (stage 7: the server scrapes them instead of guessing
+    // from n_entries(), which stays flat when a save immediately triggers an eviction)
+    uint64_t n_new_writes_total() const;
+    uint64_t n_evictions_total()  const;
+
     // candidate search: one pass over the request tokens (rolling hash), then the short list is
     // verified against the exact token array from states/<id>.meta; only an entry whose tokens are
     // an exact prefix of `tokens` is usable, and then LCP = entry.n_tokens
     bool find(const std::vector<llama_token> & tokens, server_disk_cache_candidate & out) const;
+
+    // Stage 7: the entry that shares the longest common prefix with the request. Unlike find(),
+    // the entry does not have to be a prefix of the request - it may be longer.
+    bool find_best(const std::vector<llama_token> & tokens, server_disk_cache_candidate & out) const;
 
     // exact token array of an entry, read from states/<id>.meta
     bool tokens_of(uint64_t id, std::vector<llama_token> & out) const;
@@ -257,6 +301,17 @@ public:
     // restore the target sequence state from the payload file (llama_state_seq_load_file) and
     // return the extra sections, if the caller asks for them
     bool load(llama_context * ctx_tgt, llama_seq_id seq_id, uint64_t id, server_disk_cache_extra * extra_out);
+
+    // Stage 8: start reading an entry on a worker thread. The returned job is ready when
+    // job->done is set; apply it with llama_state_seq_set_data_ext() on the context's own thread.
+    std::shared_ptr<server_disk_cache_load_job> load_begin(uint64_t id);
+
+    // Lifecycle guard (stage 6): an entry that is being read is never unlinked by eviction.
+    // The internal lock is expected to be held (every read path holds it); the pair is public so
+    // tests can pin an entry and check that eviction walks around it.
+    void begin_read(uint64_t id) const;
+    void end_read(uint64_t id) const;
+    size_t n_inflight() const;
 
     // full payload read-back, for tests and debugging (keeps the whole payload in RAM)
     bool read_payload(uint64_t id, std::vector<uint8_t> & main_out, server_disk_cache_extra * extra_out) const;
@@ -320,6 +375,9 @@ private:
 
     uint64_t index_add_payload_bytes(uint64_t delta);
 
+    size_t remove_many(const std::vector<uint64_t> & ids); // one pass + one index rebuild
+    std::vector<uint64_t> lru_ids() const;                 // ids ordered by last_used (oldest first)
+
     int64_t  remove_files(uint64_t id) const;  // returns the freed bytes, -1 on error
     uint64_t dir_bytes(const std::string & dir) const;
     void     enforce_limit();
@@ -343,4 +401,9 @@ private:
     uint64_t next_id    = 1;
     uint64_t n_bytes_   = 0;
     uint64_t root_bytes_ = 0;
+
+    mutable std::unordered_map<uint64_t, int> inflight; // id -> number of readers
+
+    uint64_t new_writes_total_ = 0; // entries actually written (a dedup hit does not count)
+    uint64_t evictions_total_  = 0; // entries dropped by the size limit / explicit eviction
 };

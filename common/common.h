@@ -637,6 +637,7 @@ struct common_params {
     int64_t     cache_disk_size        = 500LL * 1024 * 1024 * 1024; // --cache-disk-size: limit of the WHOLE cache root, in bytes
     int32_t     cache_disk_read_mbps   = 200;   // --cache-disk-read-mbps: assumed sequential read speed, decimal MB/s
     int32_t     cache_disk_min_gain_ms = 1000;  // --cache-disk-min-gain-ms: minimum expected gain
+    int32_t     cache_disk_min_tokens  = 1024;  // --cache-disk-min-tokens: short prompts are not stored on disk
     int32_t     cache_prefill_tps      = 0;     // --cache-prefill-tps: prefill speed override, 0 = auto
 
     std::string hostname      = "127.0.0.1";

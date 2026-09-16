@@ -347,6 +347,14 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // Stage 6 fix: the slot holds a fully evaluated prompt that is not on disk yet. Set when the
+    // prefill completes, cleared after the deferred save in update_slots().
+    bool disk_save_pending = false;
+
+    // Stage 8: a disk restore whose payload is coming off the disk on a worker thread. Applied in
+    // update_slots() as soon as the read is done; the slot waits instead of blocking the loop.
+    std::shared_ptr<server_disk_cache_load_job> disk_load;
+
     common_memory mem;
 
     // multimodal
@@ -1507,6 +1515,7 @@ private:
             dcfg.size_limit_bytes = (uint64_t) std::max<int64_t>(0, params_base.cache_disk_size);
             dcfg.read_mbps        = params_base.cache_disk_read_mbps;
             dcfg.min_gain_ms      = params_base.cache_disk_min_gain_ms;
+            dcfg.min_tokens       = params_base.cache_disk_min_tokens;
             dcfg.prefill_tps      = params_base.cache_prefill_tps;
 
             disk_cache = std::make_unique<server_disk_cache>(dcfg, fp);
@@ -1783,9 +1792,18 @@ private:
 
         const llama_tokens tokens = slot.prompt.tokens.get_tokens();
 
+        // Stage 6: a state costs disk space and a write regardless of how long the prompt is, so a
+        // short prompt can never pay that back - it is not persisted at all.
+        const int32_t min_tokens = disk_cache->config().min_tokens;
+        if (min_tokens > 0 && (int32_t) tokens.size() < min_tokens) {
+            SRV_TRC("disk cache: prompt of %zu tokens is below --cache-disk-min-tokens (%d), not stored\n",
+                    tokens.size(), min_tokens);
+            return false;
+        }
+
         server_disk_cache_extra extra = disk_cache_make_extra(slot);
 
-        const size_t n_before = disk_cache->n_entries();
+        const uint64_t w_before = disk_cache->n_new_writes_total();
         const int64_t t_start = ggml_time_us();
 
         const uint64_t id = disk_cache->save(slot.ctx_tgt, slot.id, tokens, std::move(extra));
@@ -1797,7 +1815,7 @@ private:
             return false;
         }
 
-        if (disk_cache->n_entries() > n_before) {
+        if (disk_cache->n_new_writes_total() > w_before) {
             server_disk_cache_entry entry;
             if (disk_cache->entry_info(id, entry)) {
                 metrics.disk_cache_writes++;
@@ -1826,6 +1844,10 @@ private:
         if (state.prompt.tokens.empty() || state.data.main.empty()) {
             return;
         }
+        if (disk_cache->config().min_tokens > 0 &&
+            (int32_t) state.prompt.tokens.size() < disk_cache->config().min_tokens) {
+            return;
+        }
 
         server_disk_cache_extra extra;
 
@@ -1844,7 +1866,7 @@ private:
             extra.ckpt.push_back(std::move(blob));
         }
 
-        const size_t n_before = disk_cache->n_entries();
+        const uint64_t w_before = disk_cache->n_new_writes_total();
         const int64_t t_start = ggml_time_us();
 
         const uint64_t id = disk_cache->save_raw(state.prompt.tokens.get_tokens(), state.data.main, std::move(extra));
@@ -1856,7 +1878,7 @@ private:
             return;
         }
 
-        if (disk_cache->n_entries() > n_before) {
+        if (disk_cache->n_new_writes_total() > w_before) {
             metrics.disk_cache_writes++;
             server_disk_cache_entry entry;
             if (disk_cache->entry_info(id, entry)) {
@@ -1868,6 +1890,90 @@ private:
             SRV_TRC("disk cache: evicted RAM-cache state (%zu tokens) is already stored (id=%llu)\n",
                     state.prompt.tokens.size(), (unsigned long long) id);
         }
+    }
+
+    // Stage 8: apply a state a worker thread has finished reading. Returns false while the read is
+    // still going on, so the caller skips the slot for this round instead of waiting for the disk -
+    // the loop keeps serving the other slots meanwhile.
+    bool disk_cache_apply_restore(server_slot & slot) {
+        if (!slot.disk_load) {
+            return true;
+        }
+
+        if (!slot.disk_load->done) {
+            return false;
+        }
+
+        const std::shared_ptr<server_disk_cache_load_job> job = slot.disk_load;
+        slot.disk_load.reset(); // the in-flight mark is released together with the job
+
+        const uint64_t id = job->id;
+
+        if (job->failed) {
+            metrics.disk_cache_corrupt_entries++;
+            SRV_ERR("disk cache: failed to read entry %llu (%zu tokens), removing it\n",
+                    (unsigned long long) id, (size_t) job->n_tokens);
+
+            slot.prompt_clear();
+            disk_cache->remove_entry(id);
+            return true;
+        }
+
+        const size_t n = llama_state_seq_set_data_ext(slot.ctx_tgt, job->state.data(), job->state.size(), slot.id, 0);
+        if (n == 0) {
+            metrics.disk_cache_corrupt_entries++;
+            SRV_ERR("disk cache: failed to apply the state of entry %llu, removing it\n", (unsigned long long) id);
+
+            slot.prompt_clear();
+            disk_cache->remove_entry(id);
+            return true;
+        }
+
+        const double t_s = (ggml_time_us() - job->t_start_us) / 1e6;
+
+        slot.prompt.checkpoints.clear();
+        for (auto & blob : job->extra.ckpt) {
+            common_prompt_checkpoint ckpt;
+            if (!dc_ckpt_unpack(blob.data, ckpt)) {
+                SRV_WRN("disk cache: cannot unpack a checkpoint of entry %llu, it is dropped\n", (unsigned long long) id);
+                continue;
+            }
+            slot.prompt.checkpoints.push_back(std::move(ckpt));
+        }
+
+        // the draft state goes into ctx_dft exactly like the RAM-cache path does it
+        if (!job->extra.dft.empty()) {
+            if (slot.ctx_dft == nullptr) {
+                SRV_WRN("%s", "disk cache: entry has a draft state but the slot has no draft context\n");
+            } else {
+                const auto & blob = job->extra.dft[0];
+                const size_t nd = llama_state_seq_set_data_ext(slot.ctx_dft, blob.data.data(), blob.data.size(), slot.id, 0);
+                if (nd != blob.data.size()) {
+                    SRV_WRN("disk cache: failed to restore the draft state of entry %llu (%zu of %zu bytes)\n",
+                            (unsigned long long) id, nd, blob.data.size());
+                }
+            }
+        }
+
+        if (!job->extra.spec.empty() && spec) {
+            common_speculative_set_state(spec.get(), slot.id, job->extra.spec[0].data);
+        }
+
+        // the state covers the whole entry, so the slot takes the entry token list as it is; the
+        // request is matched against it by the usual common-prefix logic
+        slot.prompt.tokens = server_tokens(job->tokens, false);
+
+        disk_cache->touch(id);
+
+        metrics.disk_cache_restores++;
+        metrics.disk_cache_restore_bytes        += job->restore_bytes;
+        metrics.disk_cache_restore_seconds      += t_s;
+        metrics.disk_cache_saved_prefill_tokens += job->n_tokens_match;
+
+        SRV_INF("disk cache: restored %zu tokens in %.3fs (%.2f MiB, %.1f MB/s, read in the background)\n",
+                (size_t) job->n_tokens_match, t_s, (double) job->restore_bytes / (1024.0 * 1024.0),
+                t_s > 0.0 ? (double) job->restore_bytes / t_s / 1e6 : 0.0);
+        return true;
     }
 
     // Stage 4 4.2/4.3: compare the state the slot holds right now (resident, possibly just taken
@@ -1903,8 +2009,17 @@ private:
         server_prefix_candidate_estimate(cand_res, n_prompt, tps, read_bps);
 
         server_disk_cache_candidate cand_disk;
-        if (!disk_cache->find(task.tokens.get_tokens(), cand_disk)) {
+        if (!disk_cache->find_best(task.tokens.get_tokens(), cand_disk)) {
             metrics.disk_cache_misses++;
+            return;
+        }
+
+        // entries left by an older build (before --cache-disk-min-tokens existed) are as useless as
+        // if they had never been written
+        if (cfg.min_tokens > 0 && (int32_t) cand_disk.lcp < cfg.min_tokens) {
+            metrics.disk_cache_misses++;
+            SRV_TRC("disk cache: candidate reusing %zu tokens is below --cache-disk-min-tokens (%d), ignored\n",
+                    cand_disk.lcp, cfg.min_tokens);
             return;
         }
 
@@ -1914,7 +2029,8 @@ private:
         cand.source         = SERVER_PREFIX_SOURCE_DISK;
         cand.state_id       = cand_disk.id;
         cand.n_tokens_state = cand_disk.n_tokens;
-        cand.n_tokens_match = cand_disk.n_tokens; // find() guarantees an exact prefix
+        // the common prefix is what the request actually reuses; the state covers the whole entry
+        cand.n_tokens_match = cand_disk.lcp;
         cand.restore_bytes  = cand_disk.payload_bytes;
         server_prefix_candidate_estimate(cand, n_prompt, tps, read_bps);
 
@@ -1939,76 +2055,28 @@ private:
                 cand.n_tokens_match, (double) cand.restore_bytes / (1024.0 * 1024.0),
                 cand_res.n_tokens_match, reason.c_str());
 
-        const int64_t t_restore_start = ggml_time_us();
-
-        server_disk_cache_extra extra;
-        if (!disk_cache->load(slot.ctx_tgt, slot.id, cand.state_id, &extra)) {
+        // Stage 8: the state is read on a worker thread and applied in update_slots() as soon as it
+        // is there, so a multi-GB read no longer holds up the loop (and every other slot).
+        auto job = disk_cache->load_begin(cand.state_id);
+        if (!job) {
             metrics.disk_cache_corrupt_entries++;
-            SRV_ERR("disk cache: failed to restore entry %llu (%zu tokens), removing it\n",
-                    (unsigned long long) cand.state_id, cand.n_tokens_match);
+            SRV_ERR("disk cache: cannot start the restore of entry %llu, removing it\n",
+                    (unsigned long long) cand.state_id);
 
-            // the target state may have been partially overwritten, so the slot state cannot be
-            // trusted any more; drop it and let the request do a full prefill
-            slot.prompt_clear();
-
-            disk_cache->remove_entry(cand.state_id);
-            return;
-        }
-
-        const double t_restore_s = (ggml_time_us() - t_restore_start) / 1e6;
-
-        // the entry tokens are an exact prefix of the request, restore them into the slot
-        llama_tokens tokens;
-        if (!disk_cache->tokens_of(cand.state_id, tokens) || tokens.size() != cand.n_tokens_match) {
-            metrics.disk_cache_corrupt_entries++;
-            SRV_ERR("disk cache: entry %llu has no readable token list, removing it\n", (unsigned long long) cand.state_id);
-
+            // the entry is unusable, so the slot state cannot be trusted any more either
             slot.prompt_clear();
             disk_cache->remove_entry(cand.state_id);
             return;
         }
 
-        slot.prompt.checkpoints.clear();
-        for (auto & blob : extra.ckpt) {
-            common_prompt_checkpoint ckpt;
-            if (!dc_ckpt_unpack(blob.data, ckpt)) {
-                SRV_WRN("disk cache: cannot unpack a checkpoint of entry %llu, it is dropped\n", (unsigned long long) cand.state_id);
-                continue;
-            }
-            slot.prompt.checkpoints.push_back(std::move(ckpt));
-        }
+        job->n_tokens_match = cand.n_tokens_match;
+        slot.disk_load      = job;
 
-        // the draft state goes into ctx_dft exactly like the RAM-cache path does it
-        if (!extra.dft.empty()) {
-            if (slot.ctx_dft == nullptr) {
-                SRV_WRN("%s", "disk cache: entry has a draft state but the slot has no draft context\n");
-            } else {
-                const auto & blob = extra.dft[0];
-                const size_t n = llama_state_seq_set_data_ext(slot.ctx_dft, blob.data.data(), blob.data.size(), slot.id, 0);
-                if (n != blob.data.size()) {
-                    SRV_WRN("disk cache: failed to restore the draft state of entry %llu (%zu of %zu bytes)\n",
-                            (unsigned long long) cand.state_id, n, blob.data.size());
-                }
-            }
-        }
-
-        if (!extra.spec.empty() && spec) {
-            common_speculative_set_state(spec.get(), slot.id, extra.spec[0].data);
-        }
-
-        slot.prompt.tokens = server_tokens(tokens, false);
-
-        disk_cache->touch(cand.state_id);
-
-        metrics.disk_cache_restores++;
-        metrics.disk_cache_restore_bytes    += cand.restore_bytes;
-        metrics.disk_cache_restore_seconds  += t_restore_s;
         metrics.disk_cache_disk_preferred++;
-        metrics.disk_cache_saved_prefill_tokens += cand.n_tokens_match;
 
-        SRV_INF("disk cache: restored %zu tokens in %.3fs (%.2f MiB, %.1f MB/s)\n",
-                cand.n_tokens_match, t_restore_s, (double) cand.restore_bytes / (1024.0 * 1024.0),
-                t_restore_s > 0.0 ? (double) cand.restore_bytes / t_restore_s / 1e6 : 0.0);
+        SRV_INF("disk cache: reading %zu tokens of entry %llu in the background (%.2f MiB)\n",
+                cand.n_tokens_match, (unsigned long long) cand.state_id,
+                (double) cand.restore_bytes / (1024.0 * 1024.0));
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -2126,8 +2194,10 @@ private:
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
 
-            // Stage 4 4.2: resident (incl. the state just loaded from the RAM cache) vs disk
-            if (task.type == SERVER_TASK_TYPE_COMPLETION) {
+            // Stage 4 4.2: resident (incl. the state just loaded from the RAM cache) vs disk.
+            // Same gate as the regular prompt-reuse path: a client that sent "cache_prompt": false
+            // must not receive a state from the disk cache either.
+            if (task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt) {
                 disk_cache_try_restore(*ret, task);
             }
         }
@@ -2996,6 +3066,7 @@ private:
 
                     // Stage 5: gauge, sampled when the metrics are scraped
                     metrics.disk_cache_index_entries = disk_cache_enabled() ? disk_cache->n_entries() : 0;
+                    metrics.disk_cache_evictions     = disk_cache_enabled() ? disk_cache->n_evictions_total() : 0;
 
                     res->metrics             = metrics;
 
@@ -3287,6 +3358,32 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // Stage 8: a restore that is not claimed by a task any more (the slot went idle, the task
+        // was cancelled) is dropped here; the read itself already ran on its own thread
+        if (disk_cache_enabled()) {
+            for (auto & slot : slots) {
+                if (slot.disk_load && slot.disk_load->done && !slot.is_processing()) {
+                    slot.disk_load.reset();
+                }
+            }
+        }
+
+        // Stage 6 fix: deferred save of a request that already finished its prefill. The write runs
+        // here, in the main loop, so the first token is not delayed and no extra request is needed
+        // to get a single request persisted.
+        if (disk_cache_enabled()) {
+            for (auto & slot : slots) {
+                if (!slot.disk_save_pending) {
+                    continue;
+                }
+                if (slot.is_processing()) {
+                    continue; // the state is still changing
+                }
+                disk_cache_save_slot(slot, "request end");
+                slot.disk_save_pending = false;
+            }
+        }
 
         // check if all slots are idle
         {
@@ -3617,6 +3714,12 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // Stage 8: the state of this slot may still be coming off the disk on a worker
+                    // thread - leave the prompt alone until it has been applied
+                    if (!disk_cache_apply_restore(slot)) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -4319,6 +4422,16 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // Stage 6 fix: the prompt of this request is fully evaluated - remember that the
+                // state should be persisted once the slot stops processing. Saving right here would
+                // delay the first token; waiting for the next task meant a single request was never
+                // written to disk. A client that disabled prompt reuse is not persisted either.
+                // note: disk_cache is a nullptr unless --cache-disk is given, so the config must not
+                //       be touched without asking disk_cache_enabled() first
+                slot.disk_save_pending = disk_cache_enabled() && slot.task->params.cache_prompt &&
+                    (disk_cache->config().min_tokens <= 0 ||
+                     (int32_t) slot.prompt.tokens.size() >= disk_cache->config().min_tokens);
 
                 // Stage 5: refresh the prefill-throughput estimate from this real measurement
                 if (slot.stats.is_set() && slot.stats.n_prompt_processed > 0 && slot.stats.t_prompt_ms() > 0.0) {

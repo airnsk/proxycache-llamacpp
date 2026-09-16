@@ -17,8 +17,8 @@ inside `llama-server` and uses the streaming sequence-state API.
 | 2 | namespace, manifest, index, atomic writes | done |
 | 3 | streamed state save/load | done |
 | 4+5 | slot selection (resident vs disk), save hooks, cost model, metrics | done |
-| 6 | eviction/lifecycle, crash recovery, dedup | in progress |
-| 7 | tests A–L, benchmark | in progress |
+| 6 | eviction/lifecycle, crash recovery, dedup | done |
+| 7 | tests A–L, benchmark | done |
 
 ## What is in the commits
 
@@ -33,6 +33,7 @@ llama-server -m model.gguf -ngl 99 -fa on -c 160000 \
   --cache-ram 32768 \
   --cache-disk /mnt/cache \
   --cache-disk-size 500 \
+  --cache-disk-min-tokens 1024 \
   --cache-disk-read-mbps 200 \
   --cache-disk-min-gain-ms 1000 \
   --cache-idle-slots --metrics
@@ -41,6 +42,20 @@ llama-server -m model.gguf -ngl 99 -fa on -c 160000 \
 `--cache-disk <path>` enables the disk level and points at the cache root
 (the size limit applies to the whole root). Without it, behaviour is exactly
 as upstream.
+
+`--cache-disk-min-tokens <n>` (default 1024) keeps short prompts out of the
+cache: below that length a restore saves less than it costs, so nothing is
+written and nothing is restored.
+
+## How a prompt is matched
+
+A saved state covers the prompt *and* the tokens generated after it, so the
+lookup does not require a state to be a prefix of the request. The entry with
+the longest common prefix wins - it may well be longer than the request - and
+the surplus is dropped by the ordinary slot logic once the state is loaded,
+the same way the in-RAM prompt cache selects and loads a state. A repeat of a
+prompt that was seen before is therefore a hit even though the stored state
+continues past the end of that prompt.
 
 ## Documentation
 
