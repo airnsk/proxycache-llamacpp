@@ -1786,7 +1786,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[(size_t) seq_id * n_chains].get());
 
-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[(size_t) seq_id * n_chains].data(), row_bytes);
 
             i_last[(size_t) seq_id * n_chains] = batch.n_tokens - 1;
@@ -1976,11 +1976,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // root row (id_last) decodes once on the owning seq; siblings are primed from it
             // via llama_memory_seq_cp below (agreed design - no multi-tag rows, the ctx_dft
             // batch is allocated with n_seq_max = 1 per row-group)
-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[f0].data(), row_bytes);
 
             last_row[f0] = batch.n_tokens - 1;
-            pos_next[f0] = dp.n_past + 1;
+            pos_next[f0] = dp.pos0 + 1;
         }
 
         if (batch.n_tokens == 0) {
@@ -2095,11 +2095,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // first drafted token (pos n_past+1) is not copied - it is decoded after this
                 // loop, so no stale cell exists yet; the next round removes leftovers on rm.
                 llama_memory_seq_rm(mem_dft, sib, 0, -1);
-                llama_memory_seq_cp(mem_dft, seq_id, sib, 0, dp.n_past + 1);
+                llama_memory_seq_cp(mem_dft, seq_id, sib, 0, dp.pos0 + 1);
 
                 (*dp.chains)[c].push_back(idc);
                 active[f] = true;
-                pos_next[f] = dp.n_past + 1;
+                pos_next[f] = dp.pos0 + 1;
 
                 common_batch_add(batch, idc, pos_next[f], { sib }, true);
                 std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_root, row_bytes);
