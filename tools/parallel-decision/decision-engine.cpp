@@ -173,11 +173,12 @@ struct decision_field {
 
 // ---------------------------------------------------------------- engine
 
-engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, prefix_store * store)
+engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, prefix_store * store, int n_prefixes)
     : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
-      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1), store(store) {
-    if (n_seqs < 3) {
-        throw std::invalid_argument("a decision engine needs at least 3 sequences");
+      seq_snaps(seq_base), n_snap(std::max(1, n_prefixes)), seq_pool(seq_base + std::max(1, n_prefixes)),
+      n_pool(n_seqs - std::max(1, n_prefixes)), store(store) {
+    if (n_seqs < n_snap + 2) {
+        throw std::invalid_argument("a decision engine needs at least n_prefixes + 2 sequences");
     }
 }
 
@@ -219,29 +220,53 @@ void engine::decode_parts(const std::vector<prompt_part> & parts) {
 // Restore (or build) the cached static prefix on seq_snap. Only this engine's own sequences are
 // touched, so it can share a context with other users (e.g. server slots).
 bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
-    if (allow_cache && !shared.empty() && shared == cached &&
-        llama_memory_seq_pos_max(mem, seq_snap) == (llama_pos) cached.size() - 1) {
-        return true;
+    // 1) already resident: reuse its cells (this is the whole point of keeping several prefixes)
+    if (allow_cache && !shared.empty()) {
+        for (auto & e : prefix_tab) {
+            if (e.toks == shared &&
+                llama_memory_seq_pos_max(mem, e.seq) == (llama_pos) shared.size() - 1) {
+                e.used   = ++clock;
+                cur_snap = e.seq;
+                return true;
+            }
+        }
     }
-    // the engine's sequences are a fixed pool reused per request: drop the previous content so the
-    // branches fork from a clean snapshot
-    for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
-        llama_memory_seq_rm(mem, s, -1, -1);
-    }
-    cached.clear();
     if (shared.empty()) {
+        prefix_tab.clear();
+        cur_snap = -1;
         return false;
     }
-    // the store may still hold this prefix (it was evicted from KV, or the server was restarted):
-    // restoring it costs a state read instead of a full prefill
-    if (allow_cache && store != nullptr && store->load(shared, seq_snap)) {
-        cached = shared;
+    // 2) take a snapshot slot: a free one, otherwise the least recently used entry
+    size_t victim;
+    if ((int) prefix_tab.size() < n_snap) {
+        prefix_tab.push_back({});
+        victim = prefix_tab.size() - 1;
+    } else {
+        victim     = 0;
+        uint64_t oldest = UINT64_MAX;
+        for (size_t i = 0; i < prefix_tab.size(); ++i) {
+            if (prefix_tab[i].used < oldest) {
+                oldest = prefix_tab[i].used;
+                victim = i;
+            }
+        }
+    }
+    auto & e = prefix_tab[victim];
+    const llama_seq_id seq = seq_snaps + (llama_seq_id) victim;
+    llama_memory_seq_rm(mem, seq, -1, -1);
+    e.toks.clear();
+    e.seq    = seq;
+    e.used   = ++clock;
+    cur_snap = seq;
+    // 3) the store may still hold this prefix (evicted earlier, or the server was restarted)
+    if (allow_cache && store != nullptr && store->load(shared, seq)) {
+        e.toks = shared;
         return true;
     }
-    decode_parts({ { &shared, 0, seq_snap } });
-    cached = shared;
+    decode_parts({ { &shared, 0, seq } });
+    e.toks = shared;
     if (store != nullptr) {
-        store->save(shared, seq_snap);
+        store->save(shared, seq);
     }
     return false;
 }
@@ -401,7 +426,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
             llama_memory_seq_rm(mem, trunk, -1, -1);
             if (!shared.empty()) {
-                llama_memory_seq_cp(mem, seq_snap, trunk, -1, -1);
+                llama_memory_seq_cp(mem, cur_snap, trunk, -1, -1);
             }
             parts.push_back({ &prefixes[g0 + i], (llama_pos) shared.size(), trunk });
         }

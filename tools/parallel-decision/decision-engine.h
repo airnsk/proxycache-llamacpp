@@ -85,7 +85,7 @@ struct prefix_store {
 
 class engine {
   public:
-    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, prefix_store * store = nullptr);
+    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, prefix_store * store = nullptr, int n_prefixes = 1);
 
     result decide(const std::string & shared_text, const std::string & context_text,
                   const std::vector<field_input> & fields, const options & opt);
@@ -111,10 +111,23 @@ class engine {
     llama_context     * ctx;
     const llama_vocab * vocab;
     llama_memory_t      mem;
-    llama_seq_id        seq_snap, seq_pool;
-    int                 n_pool;
-    tokens_t            cached;
-    prefix_store *      store = nullptr;
+    // Prefix table with LRU: every retained prefix owns one snapshot sequence, the pool holds the
+    // trunks and branches. A repeated prefix reuses its cells; the LRU victim is dropped, and with a
+    // store attached it is already on disk, so it can come back later without a prefill.
+    struct prefix_entry {
+        tokens_t     toks;
+        llama_seq_id seq  = -1;
+        uint64_t     used = 0;
+    };
+
+    llama_seq_id              seq_snaps;    // first snapshot sequence
+    int                       n_snap;       // how many prefixes stay resident at once
+    llama_seq_id              seq_pool;     // first trunk/branch sequence
+    int                       n_pool;
+    std::vector<prefix_entry> prefix_tab;
+    uint64_t                  clock    = 0;
+    llama_seq_id              cur_snap = -1; // snapshot the current request forks from
+    prefix_store *            store    = nullptr;
 
     tokens_t tokenize(const std::string & text, bool add_special) const;
     void     decode_parts(const std::vector<prompt_part> & parts);
