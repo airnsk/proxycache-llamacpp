@@ -248,6 +248,13 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+
+    // the /decision branch seqs and the multi-chain sibling seqs each emit one output row, so the context
+    // must be able to hold at least n_seq_max rows (the assert in output_reserve). The server-derived
+    // n_outputs_max does not cover them on the fitting path, where n_batch is small - clamp it here.
+    if (cparams.n_outputs_max < cparams.n_seq_max) {
+        cparams.n_outputs_max = cparams.n_seq_max;
+    }
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
