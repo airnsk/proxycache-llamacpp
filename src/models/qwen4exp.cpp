@@ -271,7 +271,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.enorm     = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd },             b_flags);
             layer.nextn.hnorm     = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim },            b_flags);
 
-            layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim },         b_flags);
+            layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | b_flags);
             layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, b_flags);
             layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, b_flags);
 
