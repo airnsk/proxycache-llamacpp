@@ -70,9 +70,22 @@ struct batch_result {
 // Scores decisions on an existing context with the sequence ids [seq_base, seq_base + n_seqs):
 // one keeps the cached static prefix; the rest hold one trunk (prefix + context) per context in
 // flight, then branches. The context needs a unified KV cache so branches share the trunk's cells.
+// Optional persistent store for the cached static prefix. The engine does not care where states
+// live (RAM, disk): its owner supplies two hooks and gets prefix persistence across KV eviction
+// and server restarts for free. A null store keeps the in-memory-only behaviour.
+struct prefix_store {
+    virtual ~prefix_store() = default;
+
+    // restore the state of `toks` into `seq`; false when the store does not have it
+    virtual bool load(const tokens_t & toks, llama_seq_id seq) = 0;
+
+    // persist the state currently living in `seq` under `toks`
+    virtual void save(const tokens_t & toks, llama_seq_id seq) = 0;
+};
+
 class engine {
   public:
-    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs);
+    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, prefix_store * store = nullptr);
 
     result decide(const std::string & shared_text, const std::string & context_text,
                   const std::vector<field_input> & fields, const options & opt);
@@ -101,6 +114,7 @@ class engine {
     llama_seq_id        seq_snap, seq_pool;
     int                 n_pool;
     tokens_t            cached;
+    prefix_store *      store = nullptr;
 
     tokens_t tokenize(const std::string & text, bool add_special) const;
     void     decode_parts(const std::vector<prompt_part> & parts);

@@ -173,9 +173,9 @@ struct decision_field {
 
 // ---------------------------------------------------------------- engine
 
-engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
+engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, prefix_store * store)
     : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
-      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1) {
+      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1), store(store) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
     }
@@ -223,13 +223,25 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
         llama_memory_seq_pos_max(mem, seq_snap) == (llama_pos) cached.size() - 1) {
         return true;
     }
+    // the engine's sequences are a fixed pool reused per request: drop the previous content so the
+    // branches fork from a clean snapshot
     for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
         llama_memory_seq_rm(mem, s, -1, -1);
     }
     cached.clear();
-    if (!shared.empty()) {
-        decode_parts({ { &shared, 0, seq_snap } });
+    if (shared.empty()) {
+        return false;
+    }
+    // the store may still hold this prefix (it was evicted from KV, or the server was restarted):
+    // restoring it costs a state read instead of a full prefill
+    if (allow_cache && store != nullptr && store->load(shared, seq_snap)) {
         cached = shared;
+        return true;
+    }
+    decode_parts({ { &shared, 0, seq_snap } });
+    cached = shared;
+    if (store != nullptr) {
+        store->save(shared, seq_snap);
     }
     return false;
 }

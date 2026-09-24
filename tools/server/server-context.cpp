@@ -19,6 +19,33 @@
 #include "mtmd-helper.h"
 #include "decision-engine.h"
 
+// Bridges the decision engine's prefix store onto the server's disk cache: the cached static prefix
+// (instructions + field catalogue) is saved and restored as an ordinary state entry of this
+// server's namespace, so it survives KV eviction and server restarts instead of being re-prefilled.
+struct decision_prefix_store final : llama_decision::prefix_store {
+    server_disk_cache * dc  = nullptr;
+    llama_context *     ctx = nullptr;
+
+    bool load(const llama_decision::tokens_t & toks, llama_seq_id seq) override {
+        if (dc == nullptr || ctx == nullptr) {
+            return false;
+        }
+        server_disk_cache_candidate cand;
+        if (!dc->find(toks, cand)) {
+            return false;
+        }
+        return dc->load(ctx, seq, cand.id, nullptr);
+    }
+
+    void save(const llama_decision::tokens_t & toks, llama_seq_id seq) override {
+        if (dc == nullptr || ctx == nullptr) {
+            return;
+        }
+        server_disk_cache_extra extra;
+        dc->save(ctx, seq, toks, std::move(extra));
+    }
+};
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -967,6 +994,7 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
     std::unique_ptr<llama_decision::engine> decision_engine; // created by the first /decision request
+    std::unique_ptr<llama_decision::prefix_store> decision_store; // its persistent prefix (may be null)
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
@@ -1471,11 +1499,9 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-                // with a disk cache, the RAM cache is the L2 of a multi-tier setup: default it to 32 GiB
-        // unless -cram/--cache-ram was set explicitly
-        const int32_t cache_ram_mib = params_base.cache_ram_mib_set
-                ? params_base.cache_ram_mib
-                : (!params_base.cache_disk.empty() ? 32768 : params_base.cache_ram_mib);
+        // the RAM prompt cache keeps its normal default (8192 MiB) also when the disk cache is on:
+        // the disk level is an additive L2 and does not raise the RAM budget by itself
+        const int32_t cache_ram_mib = params_base.cache_ram_mib;
 
         if (cache_ram_mib != 0) {
             if (cache_ram_mib < 0) {
@@ -2944,8 +2970,13 @@ private:
             throw std::invalid_argument("\"schema\" must be provided");
         }
         if (!decision_engine) {
+            // when the disk cache is on, the prefix can be restored from it (and saved into it)
+            auto * store = new decision_prefix_store();
+            store->dc  = disk_cache.get();
+            store->ctx = ctx_tgt;
+            decision_store.reset(store);
             decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
-                                                                        params_base.n_seq_decision);
+                                                                        params_base.n_seq_decision, store);
         }
         const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
         std::string shared;
