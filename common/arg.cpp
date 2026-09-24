@@ -2668,6 +2668,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.decision_webui = false;
             }
         ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-prefixes"}, "N",
+            string_format("static prefixes the decision engine keeps resident, LRU-evicted (default: %d; needs %d+2 <= --decision-seqs)", params.n_decision_prefixes, params.n_decision_prefixes),
+            [](common_params & params, int value) {
+                if (value < 1) {
+                    throw std::invalid_argument("--decision-prefixes needs at least 1");
+                }
+                params.n_decision_prefixes = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_PREFIXES").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

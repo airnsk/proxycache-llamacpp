@@ -2976,7 +2976,8 @@ private:
             store->ctx = ctx_tgt;
             decision_store.reset(store);
             decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
-                                                                        params_base.n_seq_decision, store);
+                                                                        params_base.n_seq_decision, store,
+                                                                        params_base.n_decision_prefixes);
         }
         const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
         std::string shared;
