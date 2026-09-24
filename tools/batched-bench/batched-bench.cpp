@@ -144,9 +144,15 @@ int llama_batched_bench(int argc, char ** argv) {
 
                 common_batch_clear(batch);
 
+                // identical prompt for every sequence: the rows stay identical, so the MoE
+                // router selects the same experts for all of them (expert-read sharing test)
+                std::vector<llama_token> pp_tokens(pp);
+                for (int i = 0; i < pp; ++i) {
+                    pp_tokens[i] = get_token_rand();
+                }
                 for (int j = 0; j < (is_pp_shared ? 1 : pl); ++j) {
                     for (int i = 0; i < pp; ++i) {
-                        common_batch_add(batch, get_token_rand(), i, { j }, i == pp - 1);
+                        common_batch_add(batch, pp_tokens[i], i, { j }, i == pp - 1);
                     }
                 }
 
@@ -209,8 +215,10 @@ int llama_batched_bench(int argc, char ** argv) {
                     for (int i = 0; i < tg; ++i) {
                         common_batch_clear(batch);
 
+                        // same token for every sequence on this step: identical rows
+                        const llama_token tok_i = get_token_rand();
                         for (int j = 0; j < pl; ++j) {
-                            common_batch_add(batch, get_token_rand(), pp + i, { j }, true);
+                            common_batch_add(batch, tok_i, pp + i, { j }, true);
                         }
 
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
