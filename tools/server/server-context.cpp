@@ -2975,9 +2975,15 @@ private:
             store->dc  = disk_cache.get();
             store->ctx = ctx_tgt;
             decision_store.reset(store);
+            // -1 = auto: the prefix table takes half of the reserved budget and the other half stays
+            // for the trunks and branches of the scoring passes (a retained prefix costs a whole
+            // sequence, and on a hybrid model that is ~115 MiB of recurrent state, so more prefixes
+            // only makes sense while the scoring pool does not shrink)
+            const int n_pref = params_base.n_decision_prefixes < 0
+                    ? std::max(1, (params_base.n_seq_decision - 2) / 2)
+                    : params_base.n_decision_prefixes;
             decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
-                                                                        params_base.n_seq_decision, store,
-                                                                        params_base.n_decision_prefixes);
+                                                                        params_base.n_seq_decision, store, n_pref);
         }
         const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
         std::string shared;
