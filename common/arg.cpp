@@ -2656,6 +2656,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_seq_decision = value;
             }
         ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-webui"}, "serve the decision demo UI at /decision/ (default: enabled)",
+            [](common_params & params) {
+                params.decision_webui = true;
+            }
+        ).set_env("LLAMA_ARG_DECISION_WEBUI").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--no-decision-webui"}, "do not serve the decision demo UI",
+            [](common_params & params) {
+                params.decision_webui = false;
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

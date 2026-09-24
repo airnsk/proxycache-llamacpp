@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-decision-web.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -284,6 +285,18 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
     ctx_http.post("/decision",                 ex_wrapper(routes.post_decision));
     ctx_http.post("/v1/decision",              ex_wrapper(routes.post_decision));
+    // Demo UI for /v1/decision: one self-contained page, no external assets, no JS toolchain.
+    // Lives under /decision/ so the main web UI at / is untouched.
+    if (params.n_seq_decision > 0 && params.decision_webui) {
+        server_http_context::handler_t decision_web = [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->content_type = "text/html; charset=utf-8";
+            res->data         = SRV_DECISION_WEB_HTML;
+            return res;
+        };
+        ctx_http.get ("/decision",                decision_web);
+        ctx_http.get ("/decision/",               decision_web);
+    }
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
