@@ -223,12 +223,19 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
     // 1) already resident: reuse its cells (this is the whole point of keeping several prefixes)
     if (allow_cache && !shared.empty()) {
         for (auto & e : prefix_tab) {
-            if (e.toks == shared &&
-                llama_memory_seq_pos_max(mem, e.seq) == (llama_pos) shared.size() - 1) {
+            if (e.seq < 0 || e.toks != shared) {
+                continue;
+            }
+            if (llama_memory_seq_pos_max(mem, e.seq) == (llama_pos) e.toks.size() - 1) {
                 e.used   = ++clock;
                 cur_snap = e.seq;
                 return true;
             }
+            // the cells are gone (other users of the shared KV evicted them, or a defrag moved
+            // them): drop the entry right away instead of leaving dead weight in the table
+            e.toks.clear();
+            e.seq  = -1;
+            e.used = 0;
         }
     }
     if (shared.empty()) {
@@ -236,18 +243,26 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
         cur_snap = -1;
         return false;
     }
-    // 2) take a snapshot slot: a free one, otherwise the least recently used entry
-    size_t victim;
-    if ((int) prefix_tab.size() < n_snap) {
-        prefix_tab.push_back({});
-        victim = prefix_tab.size() - 1;
-    } else {
-        victim     = 0;
-        uint64_t oldest = UINT64_MAX;
-        for (size_t i = 0; i < prefix_tab.size(); ++i) {
-            if (prefix_tab[i].used < oldest) {
-                oldest = prefix_tab[i].used;
-                victim = i;
+    // 2) take a snapshot slot: a free one first, otherwise the least recently used entry
+    size_t victim = prefix_tab.size();
+    for (size_t i = 0; i < prefix_tab.size(); ++i) {
+        if (prefix_tab[i].seq < 0) {
+            victim = i;
+            break;
+        }
+    }
+    if (victim == prefix_tab.size()) {
+        if ((int) prefix_tab.size() < n_snap) {
+            prefix_tab.push_back({});
+            victim = prefix_tab.size() - 1;
+        } else {
+            victim = 0;
+            uint64_t oldest = UINT64_MAX;
+            for (size_t i = 0; i < prefix_tab.size(); ++i) {
+                if (prefix_tab[i].used < oldest) {
+                    oldest = prefix_tab[i].used;
+                    victim = i;
+                }
             }
         }
     }
