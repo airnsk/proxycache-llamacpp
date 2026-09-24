@@ -4281,6 +4281,77 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
+        {"--spec-chains"}, "N",
+        string_format("number of draft chains verified in one batch for multi-chain speculation (1 = single chain, default: %d); requires draft-mtp", params.speculative.draft.n_chains),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 16) {
+                throw std::invalid_argument("invalid value (expected 1-16)");
+            }
+            params.speculative.draft.n_chains = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAINS"));
+    add_opt(common_arg(
+        {"--spec-ngram-chain"}, "[on|off]",
+        "multi-chain: seed chain 1 with an ngram-lookup draft from the slot history instead of the MTP top-2 candidate (uses --spec-ngram-simple-size-n/m for the lookup)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.speculative.draft.ngram_chain = true;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.ngram_chain = false;
+            } else {
+                throw std::invalid_argument(string_format("unknown value for --spec-ngram-chain: '%s'", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_CHAIN"));
+    add_opt(common_arg(
+        {"--spec-chain-branch"}, "[on|off]",
+        "multi-chain: siblings share the top-1 root token and branch on the next draft step distribution instead of the sharp root top-k tail (incompatible with --spec-ngram-chain, which wins if both are set)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.speculative.draft.chain_branch = true;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.chain_branch = false;
+            } else {
+                throw std::invalid_argument(string_format("unknown value for --spec-chain-branch: '%s'", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN_BRANCH"));
+    add_opt(common_arg(
+        {"--spec-chain-p-thresh"}, "N",
+        string_format("multi-chain: spawn sibling chains only when the draft root p(top-1) is below this threshold (0 = spawn always, default: %g)", params.speculative.draft.chain_p_thresh),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("invalid value (expected 0.0-1.0)");
+            }
+            params.speculative.draft.chain_p_thresh = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN_P_THRESH"));
+    add_opt(common_arg(
+        {"--spec-chain-margin"}, "N",
+        string_format("multi-chain: spawn sibling chains only when root p(top-1)-p(top-2) is below this margin (0 = spawn always, default: %g); stricter than the absolute threshold when the MTP root distribution is bimodal", params.speculative.draft.chain_margin),
+        [](common_params & params, const std::string & value) {
+            float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("invalid value (expected 0.0-1.0)");
+            }
+            params.speculative.draft.chain_margin = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN_MARGIN"));
+    add_opt(common_arg(
+        {"--spec-approx"}, "[on|off]",
+        "multi-chain: accept the chain with the longest accepted prefix instead of the first passing chain (approximate decoding, default: off)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.speculative.draft.approx = true;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.approx = false;
+            } else {
+                throw std::invalid_argument(string_format("unknown value for --spec-approx: '%s'", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_APPROX"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {

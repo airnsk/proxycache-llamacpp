@@ -1621,10 +1621,13 @@ done:
     return res;
 }
 
-static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, const char * tag) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem, seq_id);
+        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d [%s ctx=%p n_rs_seq=%u n_seq_max=%u pos_min=%d pos_max=%d]\n",
+            seq_id, p0, p1, tag, (void *) ctx, llama_n_rs_seq(ctx), llama_n_seq_max(ctx), pos_min, pos_max).c_str());
     }
 }
 
@@ -1644,9 +1647,9 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
 }
 
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    common_context_seq_rm(ctx_tgt, seq_id, p0, p1, "tgt");
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        common_context_seq_rm(ctx_dft, seq_id, p0, p1, "dft");
     }
 }
 
@@ -1720,6 +1723,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel + params.n_seq_decision; // decision sequences sit above the slots
+
+    // multi-chain speculation: chains > 0 of each slot are verified on dedicated sibling seq ids
+    // [n_parallel, n_parallel * chains); they share the unified KV pool, so the extra ids only cost
+    // per-seq state (recurrent/hybrid models: one state buffer per seq)
+    if (params.speculative.draft.n_chains > 1) {
+        cparams.n_seq_max = (uint32_t) std::max(1, params.n_parallel) * (uint32_t) params.speculative.draft.n_chains
+                          + (uint32_t) params.n_seq_decision;
+
+        // chain branch seqs are primed via llama_memory_seq_cp from the owning seq - supported
+        // only on a unified (meta-tagged) cache; cross-stream copies need full-buffer asserts
+        cparams.kv_unified = true;
+    }
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);

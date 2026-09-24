@@ -69,6 +69,21 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // NOTE: all new fields must be appended after `result` and keep NSDMIs, because existing
+    // call sites (examples/speculative-simple, tools/server) use positional brace-init lists
+    // with /* .field = */ comments - inserting members in the middle silently shifts the mapping.
+
+    // multi-chain: cap the number of chains generated this round (-1 = use the configured value).
+    // lets the caller disable extra chains dynamically (e.g. hysteresis after repeated misses)
+    int32_t n_chains_limit = -1;
+
+    // multi-chain speculation (draft-mtp only): when non-null, draft() fills (*chains)[k]
+    // for each chain k in [0, n_chains). chain 0 is the greedy top-1 chain and is also
+    // mirrored into `result` (alias of chains->front()) so all single-chain consumers keep
+    // working unchanged. the owning slot seq is responsible for KV cleanup of the sibling
+    // chain seqs after verification.
+    std::vector<llama_tokens> * chains = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -84,6 +99,12 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// multi-chain: accept the verified prefix coming from a specific winning draft chain
+void common_speculative_accept_chain(common_speculative * spec, llama_seq_id, uint16_t n_accepted, int32_t chain);
+
+// multi-chain: number of chains actually enabled (>= 1), after resource clamping
+int32_t common_speculative_n_chains(common_speculative * spec);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
